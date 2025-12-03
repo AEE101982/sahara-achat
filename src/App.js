@@ -34,14 +34,14 @@ const PurchaseRequestSystem = () => {
   // Utilisateurs prédéfinis
   const users = [
     { 
-      username: 'jaouad', 
-      password: 'jaouad123', 
+      username: 'magasinier', 
+      password: 'mag123', 
       role: 'magasinier', 
       nom: 'Jaouad'
     },
     { 
-      username: 'amine', 
-      password: 'amine123', 
+      username: 'acheteur', 
+      password: 'ach123', 
       role: 'acheteur', 
       nom: 'Amine ELHATTAB'
     }
