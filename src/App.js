@@ -352,7 +352,7 @@ ${request.articles.map((art, i) => {
             <p className="text-xs text-gray-600 font-semibold mb-2"><center>SAHARA MOBILIER</center></p>
             <div className="space-y-1 text-xs text-gray-600">
               
-              <p><center>Copyright-2025</center><strong>New Era </strong><strong>2026</strong></p>
+              <p><center><strong>Copyright-2025</strong></center></p>
             </div>
           </div>
         </div>
