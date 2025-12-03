@@ -349,10 +349,10 @@ ${request.articles.map((art, i) => {
           </div>
 
           <div className="mt-8 p-4 bg-gray-50 rounded-lg">
-            <p className="text-xs text-gray-600 font-semibold mb-2">Comptes de démonstration:</p>
+            <p className="text-xs text-gray-600 font-semibold mb-2"><center>SAHARA MOBILIER</center></p>
             <div className="space-y-1 text-xs text-gray-600">
-              <p>👤 Magasinier - user: <strong>magasinier</strong> / pass: <strong>mag123</strong></p>
-              <p>💼 Acheteur - user: <strong>acheteur</strong> / pass: <strong>ach123</strong></p>
+              
+              <p>Copyright-2025 <strong>New Era</strong><strong>2026</strong></p>
             </div>
           </div>
         </div>
