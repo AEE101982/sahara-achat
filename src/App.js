@@ -265,8 +265,17 @@ const PurchaseRequestSystem = () => {
   const handleSubmitRequest = async () => {
     if (!formData.nomDemandeur || !formData.dateLivraisonSouhaitee) {
       alert('Veuillez remplir tous les champs obligatoires');
+     
       return;
     }
+    const articlesWithTotal = articles
+  .filter(a => a.designation)
+  .map(a => ({
+    ...a,
+    total: (parseFloat(a.prix || 0) * parseFloat(a.quantite || 0))
+  }));
+
+const totalGeneral = articlesWithTotal.reduce((sum, a) => sum + a.total, 0);
 
     // Validation articles
     const invalidArticles = articles.filter(a => a.designation && (!a.quantite || !a.dimensions || !a.prix));
@@ -283,7 +292,8 @@ const PurchaseRequestSystem = () => {
 
     const newRequest = {
       ...formData,
-      articles: articles.filter(a => a.designation),
+      articles: articlesWithTotal,
+      totalGeneral,
       statut: 'En attente',
       delaiLivraisonFournisseur: '',
       dateCreation: new Date().toISOString()
@@ -322,18 +332,21 @@ const PurchaseRequestSystem = () => {
 🚚 <b>Livraison souhaitée:</b> ${formData.dateLivraisonSouhaitee}
 
 📦 <b>Articles commandés:</b>
-${articles.filter(a => a.designation).map((art, i) => {
-      let artText = `${i + 1}. <b>${art.designation}</b>
+${articlesWithTotal.map((art, i) => {
+  return `${i + 1}. <b>${art.designation}</b>
    • Quantité: ${art.quantite}
+   • Prix unitaire: ${art.prix} MAD
+   • Total article: <b>${art.total.toFixed(2)} MAD</b>
    • Dimensions: ${art.dimensions}
-   • Prix: ${art.prix} MAD`;
-      if (art.couleur) artText += `\n   • Couleur: ${art.couleur}`;
-      if (art.fournisseur) artText += `\n   • Fournisseur: ${art.fournisseur}`;
-      return artText;
-    }).join('\n\n')}
+   ${art.couleur ? `• Couleur: ${art.couleur}` : ''}
+   ${art.fournisseur ? `• Fournisseur: ${art.fournisseur}` : ''}`;
+}).join('\n\n')}
+
+💰 <b>Total Général:</b> ${totalGeneral.toFixed(2)} MAD
 
 ⏰ <i>Demande créée le ${new Date().toLocaleString('fr-FR')}</i>
 `.trim();
+
 
     sendTelegramNotification(TELEGRAM_CONFIG.acheteurBotToken, TELEGRAM_CONFIG.acheteurChatId, telegramMessage);
 
@@ -709,8 +722,10 @@ ${(request.articles || []).map((art, i) => {
               <h2 className="text-2xl font-bold text-gray-800 mb-6">Mes Demandes</h2>
               <div className="space-y-4">
                 {requests.map(request => {
-                  const totalPrix = (request.articles || []).reduce((sum, art) => sum + (parseFloat(art.prix) || 0), 0);
-                  return (
+                  <p className="text-sm font-bold text-indigo-700 mt-2">
+                  💰 Total estimé: {totalPrix.toFixed(2)} MAD
+                </p>                
+                return (
                     <div key={request.id} className="border border-gray-200 rounded-lg p-4 hover:shadow-md transition">
                       <div className="flex justify-between items-start mb-3">
                         <div>
