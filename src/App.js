@@ -1,10 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Bell, LogIn, LogOut, CheckCircle } from 'lucide-react';
+import {
+  ShoppingCart,
+  Package,
+  Bell,
+  LogIn,
+  LogOut,
+  CheckCircle
+} from 'lucide-react';
 import { supabase } from './supabaseClient';
 
 /* ================= TELEGRAM (INCHANGÉ) ================= */
 const TELEGRAM_CONFIG = {
-  acheteurBotToken: '8210812171:AAFac_FmCYkK9d_RIuG0KJof17evWdzP37w',
+  acheteurBotToken: '8210812171:AAFac_FmCYk9d_RIuG0KJof17evWdzP37w',
   acheteurChatId: '7903997817',
   magasinierBotToken: '8104711488:AAGle7LUvv2YK2wdrDj8eJhRyWiA5HMhtUM',
   magasinierChatId: '7392016731'
@@ -14,16 +21,14 @@ const EMPTY_ARTICLE = {
   designation: '',
   quantite: '',
   dimensions: '',
-  prix: '',
-  couleur: '',
-  fournisseur: ''
+  prix: ''
 };
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
-  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
 
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [requests, setRequests] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -34,31 +39,6 @@ export default function App() {
     nomDemandeur: '',
     dateLivraisonSouhaitee: ''
   });
-
-  /* ================= SAFE HYDRATE USER ================= */
-  const hydrateUser = async (user) => {
-    let role = 'magasinier';
-    let nom = user.email;
-
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role, nom')
-      .eq('id', user.id)
-      .maybeSingle();
-
-    if (profile) {
-      role = profile.role || role;
-      nom = profile.nom || nom;
-    }
-
-    const safeUser = { ...user, role, nom };
-    setCurrentUser(safeUser);
-    setIsAuthenticated(true);
-
-    await loadRequests(role, user.id);
-    await loadNotifications(role);
-    subscribeRealtime(role, user.id);
-  };
 
   /* ================= INIT SESSION ================= */
   useEffect(() => {
@@ -81,26 +61,43 @@ export default function App() {
     return () => listener?.subscription?.unsubscribe();
   }, []);
 
+  const hydrateUser = async (user) => {
+    let role = 'magasinier';
+    let nom = user.email;
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role, nom')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (profile) {
+      role = profile.role || role;
+      nom = profile.nom || nom;
+    }
+
+    setCurrentUser({ ...user, role, nom });
+    setIsAuthenticated(true);
+
+    await loadRequests(role, user.id);
+    await loadNotifications(role);
+    subscribeRealtime(role, user.id);
+  };
+
   /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
-  let query = supabase
-    .from('requests')
-    .select('*')
-    .order('dateCreation', { ascending: false });
+    let query = supabase
+      .from('requests')
+      .select('*')
+      .order('datecreation', { ascending: false });
 
-  if (role === 'magasinier') {
-    query = query.eq('user_id', userId);
-  }
+    if (role === 'magasinier') {
+      query = query.eq('user_id', userId);
+    }
 
-  const { data, error } = await query;
-
-  if (error) {
-    console.error('Erreur loadRequests:', error);
-    return;
-  }
-
-  setRequests(data || []);
-};
+    const { data, error } = await query;
+    if (!error) setRequests(data || []);
+  };
 
   const loadNotifications = async (role) => {
     const { data } = await supabase
@@ -113,10 +110,20 @@ export default function App() {
 
   /* ================= REALTIME ================= */
   const subscribeRealtime = (role, userId) => {
+    supabase.removeAllChannels();
+
     supabase.channel('rt-requests')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, p => {
-        if (role === 'magasinier' && p.new.user_id !== userId) return;
-        setRequests(prev => [p.new, ...prev.filter(x => x.id !== p.new.id)]);
+        const r = p.new;
+        if (role === 'magasinier' && r.user_id !== userId) return;
+        setRequests(prev => [r, ...prev.filter(x => x.id !== r.id)]);
+      }).subscribe();
+
+    supabase.channel('rt-notifs')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, p => {
+        if (p.new.type === role) {
+          setNotifications(prev => [p.new, ...prev]);
+        }
       }).subscribe();
   };
 
@@ -136,12 +143,21 @@ export default function App() {
   };
 
   /* ================= NOTIFS ================= */
-  const unreadCount = useMemo(() => notifications.filter(n => !n.read).length, [notifications]);
+  const unreadCount = useMemo(
+    () => notifications.filter(n => !n.read).length,
+    [notifications]
+  );
 
   const markNotificationAsRead = async (id) => {
     await supabase.from('notifications').update({ read: true }).eq('id', id);
-    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
+    setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n));
   };
+
+  /* ================= ARTICLES ================= */
+  const addArticle = () => setArticles(p => [...p, { ...EMPTY_ARTICLE }]);
+  const updateArticle = (i, f, v) =>
+    setArticles(p => { const c = [...p]; c[i][f] = v; return c; });
+  const removeArticle = (i) => setArticles(p => p.filter((_, idx) => idx !== i));
 
   /* ================= SUBMIT REQUEST ================= */
   const handleSubmitRequest = async () => {
@@ -149,8 +165,7 @@ export default function App() {
     if (!valid.length) return alert('Articles incomplets');
 
     const totalGeneral = valid.reduce(
-      (s, a) => s + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1),
-      0
+      (s, a) => s + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1), 0
     );
 
     await supabase.from('requests').insert([{
@@ -158,23 +173,13 @@ export default function App() {
       user_id: currentUser.id,
       articles: valid,
       totalGeneral,
-      statut: 'En attente',
-      dateCreation: new Date().toISOString()
+      statut: 'En attente'
     }]);
-
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_CONFIG.acheteurBotToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CONFIG.acheteurChatId,
-        text: `🛒 Nouvelle demande d'achat\n👤 ${formData.nomDemandeur}\n💰 ${totalGeneral.toFixed(2)} MAD`
-      })
-    });
 
     setArticles([{ ...EMPTY_ARTICLE }]);
   };
 
-  /* ================= LOGIN ================= */
+  /* ================= LOGIN UI ================= */
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-indigo-700 p-4">
@@ -183,23 +188,14 @@ export default function App() {
           className="bg-white w-full max-w-sm rounded-xl p-6 space-y-4"
         >
           <h1 className="text-2xl font-bold text-center">Connexion</h1>
-
-          <input
-            type="email"
-            required
-            placeholder="Email"
+          <input type="email" required placeholder="Email"
             className="w-full p-3 border rounded-lg"
-            onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })}
+            onChange={e => setLoginForm({ ...loginForm, username: e.target.value })}
           />
-
-          <input
-            type="password"
-            required
-            placeholder="Mot de passe"
+          <input type="password" required placeholder="Mot de passe"
             className="w-full p-3 border rounded-lg"
-            onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+            onChange={e => setLoginForm({ ...loginForm, password: e.target.value })}
           />
-
           <button className="w-full bg-indigo-600 text-white py-3 rounded-lg flex justify-center gap-2">
             <LogIn /> Connexion
           </button>
@@ -211,12 +207,12 @@ export default function App() {
   /* ================= MAIN UI ================= */
   return (
     <div className="min-h-screen bg-slate-100">
-      <div className="bg-white shadow p-4 flex justify-between">
+      {/* HEADER */}
+      <div className="sticky top-0 bg-white shadow p-4 flex justify-between">
         <div>
-          <p className="font-bold">{currentUser?.nom}</p>
-          <p className="text-xs">{currentUser?.role}</p>
+          <p className="font-bold">{currentUser.nom}</p>
+          <p className="text-xs">{currentUser.role}</p>
         </div>
-
         <div className="flex gap-3">
           <button onClick={() => setShowNotifications(!showNotifications)}>
             <Bell />
@@ -226,6 +222,7 @@ export default function App() {
         </div>
       </div>
 
+      {/* NOTIFICATIONS */}
       {showNotifications && (
         <div className="p-4">
           {notifications.map(n => (
@@ -240,20 +237,56 @@ export default function App() {
         </div>
       )}
 
-      <div className="p-4 space-y-4">
-        {requests.map(r => (
-          <div key={r.id} className="bg-white p-4 rounded shadow">
-            <p className="font-bold">{r.nomDemandeur}</p>
-            <p>💰 {r.totalGeneral?.toFixed(2)} MAD</p>
-
-            {r.delaiLivraisonFournisseur && (
-              <div className="text-green-600 flex items-center gap-2 mt-2">
-                <CheckCircle /> {r.delaiLivraisonFournisseur}
+      {/* ================= VUE MAGASINIER ================= */}
+      {currentUser.role === 'magasinier' && (
+        <div className="p-4 space-y-4">
+          <div className="bg-white p-4 rounded-xl shadow">
+            <h2 className="font-bold mb-2">🛒 Nouvelle demande</h2>
+            {articles.map((a, i) => (
+              <div key={i} className="grid grid-cols-2 gap-2 mb-2">
+                <input placeholder="Désignation" className="border p-2"
+                  onChange={e => updateArticle(i, 'designation', e.target.value)} />
+                <input placeholder="Quantité" className="border p-2"
+                  onChange={e => updateArticle(i, 'quantite', e.target.value)} />
               </div>
-            )}
+            ))}
+            <button onClick={addArticle} className="text-sm text-indigo-600">+ Article</button>
+            <button onClick={handleSubmitRequest}
+              className="mt-3 w-full bg-indigo-600 text-white py-2 rounded">
+              Envoyer
+            </button>
           </div>
-        ))}
-      </div>
+
+          <div className="bg-white p-4 rounded-xl shadow">
+            <h2 className="font-bold mb-2">📦 Mes demandes</h2>
+            {requests.map(r => (
+              <div key={r.id} className="border p-2 mb-2 rounded">
+                <p className="font-semibold">{r.nomDemandeur}</p>
+                <p className="text-sm">💰 {r.totalGeneral?.toFixed(2)} MAD</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ================= VUE ACHETEUR ================= */}
+      {currentUser.role === 'acheteur' && (
+        <div className="p-4 space-y-4">
+          <h2 className="font-bold text-lg">📋 Demandes à traiter</h2>
+          {requests.map(r => (
+            <div key={r.id} className="bg-white p-4 rounded-xl shadow">
+              <p className="font-bold">{r.nomDemandeur}</p>
+              <p className="text-sm">💰 {r.totalGeneral?.toFixed(2)} MAD</p>
+              <p className="text-xs">Statut : {r.statut}</p>
+              {r.delaiLivraisonFournisseur && (
+                <div className="text-green-600 flex items-center gap-2">
+                  <CheckCircle /> {r.delaiLivraisonFournisseur}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
