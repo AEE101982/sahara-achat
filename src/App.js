@@ -3,19 +3,14 @@ import {
   ShoppingCart,
   Package,
   Bell,
-  Calendar,
-  User,
-  Clock,
-  CheckCircle,
-  AlertCircle,
   LogIn,
-  LogOut
+  LogOut,
+  CheckCircle
 } from 'lucide-react';
 import { supabase } from './supabaseClient';
+import jsPDF from 'jspdf';
 
-/* ============================================================
-   🔐 CONFIGURATION TELEGRAM — INCHANGÉE
-============================================================ */
+/* ================= TELEGRAM (INCHANGÉ) ================= */
 const TELEGRAM_CONFIG = {
   acheteurBotToken: '8210812171:AAFac_FmCYkK9d_RIuG0KJof17evWdzP37w',
   acheteurChatId: '7903997817',
@@ -23,22 +18,16 @@ const TELEGRAM_CONFIG = {
   magasinierChatId: '7392016731'
 };
 
-/* ============================================================
-   CONSTANTES
-============================================================ */
 const EMPTY_ARTICLE = {
   designation: '',
   quantite: '',
-  couleur: '',
   dimensions: '',
   prix: '',
+  couleur: '',
   fournisseur: ''
 };
 
-/* ============================================================
-   APP
-============================================================ */
-export default function PurchaseRequestSystem() {
+export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
 
@@ -55,77 +44,50 @@ export default function PurchaseRequestSystem() {
     dateLivraisonSouhaitee: ''
   });
 
-  /* ============================================================
-     INIT SESSION + PROFIL
-  ============================================================ */
+  const [devisFiles, setDevisFiles] = useState([]);
+  const [previewUrls, setPreviewUrls] = useState([]);
+
+  /* ================= INIT SESSION ================= */
   useEffect(() => {
     const init = async () => {
       const { data } = await supabase.auth.getSession();
-      const session = data?.session;
-
-      if (session?.user) {
-        setIsAuthenticated(true);
-
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('role, nom')
-          .eq('id', session.user.id)
-          .single();
-
-        setCurrentUser({ ...session.user, ...profile });
-
-        await loadRequests(profile?.role, session.user.id);
-        await loadNotifications(profile?.role);
-        subscribeRealtime(profile?.role, session.user.id);
-      }
+      if (data?.session?.user) hydrateUser(data.session.user);
     };
 
     init();
 
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      async (_event, session) => {
-        if (!session?.user) {
-          setIsAuthenticated(false);
-          setCurrentUser(null);
-          setRequests([]);
-          return;
-        }
-
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('role, nom')
-          .eq('id', session.user.id)
-          .single();
-
-        setIsAuthenticated(true);
-        setCurrentUser({ ...session.user, ...profile });
-
-        await loadRequests(profile?.role, session.user.id);
-        await loadNotifications(profile?.role);
-        subscribeRealtime(profile?.role, session.user.id);
+    const { data: listener } = supabase.auth.onAuthStateChange((_e, session) => {
+      if (!session?.user) {
+        setIsAuthenticated(false);
+        setCurrentUser(null);
+        setRequests([]);
+      } else {
+        hydrateUser(session.user);
       }
-    );
+    });
 
-    return () => {
-      listener?.subscription?.unsubscribe();
-      supabase.removeAllChannels();
-    };
+    return () => listener?.subscription?.unsubscribe();
   }, []);
 
-  /* ============================================================
-     LOADERS (SUPABASE = SOURCE DE VÉRITÉ)
-  ============================================================ */
+  const hydrateUser = async (user) => {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role, nom')
+      .eq('id', user.id)
+      .single();
+
+    setCurrentUser({ ...user, ...profile });
+    setIsAuthenticated(true);
+    loadRequests(profile?.role, user.id);
+    loadNotifications(profile?.role);
+    subscribeRealtime(profile?.role, user.id);
+  };
+
+  /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
-    let query = supabase
-      .from('requests')
-      .select('*')
-      .order('dateCreation', { ascending: false });
-
-    if (role === 'magasinier') {
-      query = query.eq('user_id', userId);
-    }
-
-    const { data } = await query;
+    let q = supabase.from('requests').select('*').order('dateCreation', { ascending: false });
+    if (role === 'magasinier') q = q.eq('user_id', userId);
+    const { data } = await q;
     setRequests(data || []);
   };
 
@@ -135,317 +97,214 @@ export default function PurchaseRequestSystem() {
       .select('*')
       .eq('type', role)
       .order('id', { ascending: false });
-
     setNotifications(data || []);
   };
 
-  /* ============================================================
-     REALTIME SUPABASE
-  ============================================================ */
+  /* ================= REALTIME ================= */
   const subscribeRealtime = (role, userId) => {
     supabase.removeAllChannels();
 
-    supabase
-      .channel('realtime-requests')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'requests' },
-        (payload) => {
-          const newRow = payload.new;
+    supabase.channel('rt-requests')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, p => {
+        const r = p.new;
+        if (role === 'magasinier' && r.user_id !== userId) return;
+        setRequests(prev => [r, ...prev.filter(x => x.id !== r.id)]);
+      }).subscribe();
 
-          if (role === 'magasinier' && newRow.user_id !== userId) return;
-
-          setRequests((prev) => {
-            const filtered = prev.filter((r) => r.id !== newRow.id);
-            return [newRow, ...filtered];
-          });
-        }
-      )
-      .subscribe();
-
-    supabase
-      .channel('realtime-notifications')
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'notifications' },
-        (payload) => {
-          if (payload.new.type === role) {
-            setNotifications((prev) => [payload.new, ...prev]);
-          }
-        }
-      )
-      .subscribe();
+    supabase.channel('rt-notifs')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, p => {
+        if (p.new.type === role) setNotifications(prev => [p.new, ...prev]);
+      }).subscribe();
   };
 
-  /* ============================================================
-     TELEGRAM
-  ============================================================ */
-  const sendTelegramNotification = async (botToken, chatId, message) => {
-    if (!botToken || !chatId) return;
-
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'HTML'
-      })
-    });
-  };
-
-  /* ============================================================
-     AUTH
-  ============================================================ */
+  /* ================= AUTH ================= */
   const handleLogin = async () => {
-    const { data, error } = await supabase.auth.signInWithPassword({
+    const { error } = await supabase.auth.signInWithPassword({
       email: loginForm.username,
       password: loginForm.password
     });
-
-    if (error) return alert('Identifiants incorrects');
-
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role, nom')
-      .eq('id', data.user.id)
-      .single();
-
-    setCurrentUser({ ...data.user, ...profile });
-    setIsAuthenticated(true);
+    if (error) alert('Identifiants incorrects');
   };
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
     setIsAuthenticated(false);
     setCurrentUser(null);
-    setRequests([]);
   };
 
-  /* ============================================================
-     NOTIFICATIONS
-  ============================================================ */
-  const unreadCount = useMemo(
-    () => notifications.filter((n) => !n.read).length,
-    [notifications]
-  );
+  /* ================= NOTIFS ================= */
+  const unreadCount = useMemo(() => notifications.filter(n => !n.read).length, [notifications]);
 
   const markNotificationAsRead = async (id) => {
     await supabase.from('notifications').update({ read: true }).eq('id', id);
-    setNotifications((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, read: true } : n))
-    );
+    setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n));
   };
 
-  const addNotification = async (message, type) => {
-    await supabase.from('notifications').insert([
-      { message, type, read: false }
-    ]);
-  };
-
-  /* ============================================================
-     ARTICLES
-  ============================================================ */
-  const addArticle = () => setArticles((p) => [...p, { ...EMPTY_ARTICLE }]);
+  /* ================= ARTICLES ================= */
+  const addArticle = () => setArticles(p => [...p, { ...EMPTY_ARTICLE }]);
   const updateArticle = (i, f, v) =>
-    setArticles((p) => {
-      const c = [...p];
-      c[i][f] = v;
-      return c;
-    });
-  const removeArticle = (i) =>
-    setArticles((p) => p.filter((_, idx) => idx !== i));
+    setArticles(p => { const c = [...p]; c[i][f] = v; return c; });
+  const removeArticle = (i) => setArticles(p => p.filter((_, idx) => idx !== i));
 
-  /* ============================================================
-     SUBMIT REQUEST
-  ============================================================ */
+  /* ================= UPLOAD DEVIS ================= */
+  const uploadDevisFiles = async (requestId) => {
+    const uploaded = [];
+    for (const file of devisFiles) {
+      const ext = file.name.split('.').pop();
+      const path = `${currentUser.id}/${requestId}_${Date.now()}.${ext}`;
+      const { error } = await supabase.storage.from('devis').upload(path, file);
+      if (!error) uploaded.push({ name: file.name, path, type: file.type });
+    }
+    return uploaded;
+  };
+
+  /* ================= SUBMIT REQUEST ================= */
   const handleSubmitRequest = async () => {
-    const validArticles = articles.filter(
-      (a) => a.designation && a.quantite && a.dimensions && a.prix
-    );
-    if (!validArticles.length) return alert('Articles incomplets');
+    const valid = articles.filter(a => a.designation && a.quantite && a.dimensions && a.prix);
+    if (!valid.length) return alert('Articles incomplets');
 
-    const totalGeneral = validArticles.reduce(
-      (s, a) =>
-        s +
-        (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1),
-      0
+    const totalGeneral = valid.reduce(
+      (s, a) => s + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1), 0
     );
 
-    const { data } = await supabase
-      .from('requests')
-      .insert([
-        {
-          ...formData,
-          user_id: currentUser.id,
-          articles: validArticles,
-          totalGeneral,
-          statut: 'En attente',
-          dateCreation: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
+    const { data: request } = await supabase.from('requests').insert([{
+      ...formData,
+      user_id: currentUser.id,
+      articles: valid,
+      totalGeneral,
+      statut: 'En attente',
+      dateCreation: new Date().toISOString()
+    }]).select().single();
 
-    setRequests((p) => [data, ...p]);
+    let devisInfo = '';
+    if (devisFiles.length) {
+      const uploaded = await uploadDevisFiles(request.id);
+      await supabase.from('requests').update({ devis_urls: uploaded }).eq('id', request.id);
+      devisInfo = '\n📎 Devis joint';
+    }
 
-    await addNotification(
-      `Nouvelle demande d'achat de ${formData.nomDemandeur}`,
-      'acheteur'
-    );
-
-    sendTelegramNotification(
-      TELEGRAM_CONFIG.acheteurBotToken,
-      TELEGRAM_CONFIG.acheteurChatId,
-      `🛒 Nouvelle demande d'achat de ${formData.nomDemandeur}`
-    );
+    fetch(`https://api.telegram.org/bot${TELEGRAM_CONFIG.acheteurBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CONFIG.acheteurChatId,
+        text: `🛒 Nouvelle demande d'achat\n👤 ${formData.nomDemandeur}\n💰 ${totalGeneral.toFixed(2)} MAD${devisInfo}`
+      })
+    });
 
     setArticles([{ ...EMPTY_ARTICLE }]);
+    setDevisFiles([]);
+    setPreviewUrls([]);
   };
 
-  /* ============================================================
-     UPDATE DELIVERY
-  ============================================================ */
-  const handleUpdateDelivery = async (id, delai) => {
-    const { data } = await supabase
-      .from('requests')
-      .update({ delaiLivraisonFournisseur: delai, statut: 'Confirmé' })
-      .eq('id', id)
-      .select()
-      .single();
-
-    setRequests((p) => p.map((r) => (r.id === id ? data : r)));
-
-    await addNotification('Délai confirmé', 'magasinier');
-
-    sendTelegramNotification(
-      TELEGRAM_CONFIG.magasinierBotToken,
-      TELEGRAM_CONFIG.magasinierChatId,
-      `✅ Délai confirmé : ${delai}`
-    );
+  /* ================= EXPORT PDF ================= */
+  const exportPDF = (r) => {
+    const pdf = new jsPDF();
+    pdf.text(`Demande d'achat - ${r.nomDemandeur}`, 10, 15);
+    let y = 30;
+    r.articles.forEach((a, i) => {
+      pdf.text(`${i + 1}. ${a.designation} - ${a.quantite} x ${a.prix} MAD`, 10, y);
+      y += 6;
+    });
+    pdf.text(`Total: ${r.totalGeneral.toFixed(2)} MAD`, 10, y + 10);
+    pdf.save(`Demande_${r.id}.pdf`);
   };
 
-  /* ============================================================
-     UI — LOGIN
-  ============================================================ */
+  /* ================= LOGIN UI ================= */
   if (!isAuthenticated) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700">
-        <div className="bg-white p-8 rounded-xl w-full max-w-md shadow-2xl">
-          <h1 className="text-3xl font-bold text-center mb-6">
-            Système d’Achats
-          </h1>
-
+      <div className="min-h-screen flex items-center justify-center bg-indigo-700 p-4">
+        <form
+          onSubmit={(e) => { e.preventDefault(); handleLogin(); }}
+          className="bg-white w-full max-w-sm rounded-xl p-6 space-y-4"
+        >
+          <h1 className="text-2xl font-bold text-center">Connexion</h1>
           <input
-            className="w-full mb-3 p-3 border rounded"
+            type="email"
+            required
             placeholder="Email"
-            onChange={(e) =>
-              setLoginForm({ ...loginForm, username: e.target.value })
-            }
+            className="w-full p-3 border rounded-lg"
+            onChange={e => setLoginForm({ ...loginForm, username: e.target.value })}
           />
           <input
             type="password"
-            className="w-full mb-4 p-3 border rounded"
+            required
             placeholder="Mot de passe"
-            onChange={(e) =>
-              setLoginForm({ ...loginForm, password: e.target.value })
-            }
+            className="w-full p-3 border rounded-lg"
+            onChange={e => setLoginForm({ ...loginForm, password: e.target.value })}
           />
-
-          <button
-            onClick={handleLogin}
-            className="w-full bg-indigo-600 text-white py-3 rounded-lg flex justify-center gap-2"
-          >
+          <button className="w-full bg-indigo-600 text-white py-3 rounded-lg flex justify-center gap-2">
             <LogIn /> Connexion
           </button>
-        </div>
+        </form>
       </div>
     );
   }
 
-  /* ============================================================
-     UI — MAIN
-  ============================================================ */
+  /* ================= MAIN UI ================= */
   return (
-    <div className="min-h-screen bg-slate-100 p-6">
-      <div className="max-w-7xl mx-auto">
-        <div className="bg-white p-6 rounded-xl shadow mb-6 flex justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">Gestion des Achats</h1>
-            <p className="text-sm text-gray-600">
-              {currentUser?.nom} — {currentUser?.role}
-            </p>
-          </div>
+    <div className="min-h-screen bg-slate-100 pb-20">
+      <div className="sticky top-0 bg-white shadow p-4 flex justify-between">
+        <div>
+          <p className="font-bold">{currentUser?.nom}</p>
+          <p className="text-xs">{currentUser?.role}</p>
+        </div>
+        <div className="flex gap-3">
+          <button onClick={() => setShowNotifications(!showNotifications)}>
+            <Bell />
+            {unreadCount > 0 && <span className="text-red-500">{unreadCount}</span>}
+          </button>
+          <button onClick={handleLogout}><LogOut /></button>
+        </div>
+      </div>
 
-          <div className="flex items-center gap-4">
-            <button onClick={() => setShowNotifications(!showNotifications)}>
-              <Bell />
-              {unreadCount > 0 && (
-                <span className="ml-1 text-red-600 font-bold">
-                  {unreadCount}
-                </span>
-              )}
-            </button>
+      {showNotifications && (
+        <div className="p-4">
+          {notifications.map(n => (
+            <div
+              key={n.id}
+              onClick={() => markNotificationAsRead(n.id)}
+              className={`p-3 rounded ${n.read ? 'bg-white' : 'bg-indigo-100'}`}
+            >
+              {n.message}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="p-4 space-y-4">
+        {requests.map(r => (
+          <div key={r.id} className="bg-white p-4 rounded-xl shadow">
+            <p className="font-bold">{r.nomDemandeur}</p>
+            <p className="text-sm">💰 {r.totalGeneral?.toFixed(2)} MAD</p>
 
             <button
-              onClick={handleLogout}
-              className="bg-red-500 text-white px-4 py-2 rounded-lg"
+              onClick={() => exportPDF(r)}
+              className="text-sm text-indigo-600 underline mt-2"
             >
-              <LogOut />
+              📄 Export PDF
             </button>
-          </div>
-        </div>
 
-        {showNotifications && (
-          <div className="bg-white rounded-xl shadow mb-6">
-            {notifications.map((n) => (
-              <div
-                key={n.id}
-                onClick={() => markNotificationAsRead(n.id)}
-                className={`p-4 border-b cursor-pointer ${
-                  !n.read ? 'bg-indigo-50' : ''
-                }`}
+            {r.devis_urls?.map((d, i) => (
+              <button
+                key={i}
+                onClick={async () => {
+                  const { data } = await supabase.storage.from('devis').createSignedUrl(d.path, 60);
+                  window.open(data.signedUrl, '_blank');
+                }}
+                className="block text-xs text-indigo-600 underline mt-1"
               >
-                {n.message}
+                📎 {d.name}
+              </button>
+            )}
+
+            {r.delaiLivraisonFournisseur && (
+              <div className="mt-2 flex items-center gap-2 text-green-600">
+                <CheckCircle /> {r.delaiLivraisonFournisseur}
               </div>
-            ))}
+            )}
           </div>
-        )}
-
-        {currentUser?.role === 'acheteur' &&
-          requests.map((r) => {
-            const totalPrix = (r.articles || []).reduce(
-              (s, a) =>
-                s +
-                (parseFloat(a.prix) || 0) *
-                  (parseFloat(a.quantite) || 1),
-              0
-            );
-
-            return (
-              <div
-                key={r.id}
-                className="bg-white p-6 rounded-xl shadow mb-4"
-              >
-                <p className="font-bold">{r.nomDemandeur}</p>
-                <p>💰 {totalPrix.toFixed(2)} MAD</p>
-
-                {!r.delaiLivraisonFournisseur && (
-                  <button
-                    onClick={() =>
-                      handleUpdateDelivery(
-                        r.id,
-                        new Date().toISOString().split('T')[0]
-                      )
-                    }
-                    className="mt-3 bg-green-600 text-white px-4 py-2 rounded-lg"
-                  >
-                    Confirmer délai
-                  </button>
-                )}
-              </div>
-            );
-          })}
+        ))}
       </div>
     </div>
   );
