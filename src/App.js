@@ -6,7 +6,8 @@ import {
   LogIn,
   LogOut,
   CheckCircle,
-  AlertTriangle
+  AlertTriangle,
+  Loader2
 } from 'lucide-react';
 import { supabase } from './supabaseClient';
 
@@ -48,32 +49,51 @@ export default function App() {
 
   /* ================= SESSION ================= */
   useEffect(() => {
-    const initializeSession = async () => {
+    const checkSession = async () => {
       try {
-        const { data } = await supabase.auth.getSession();
-        if (data?.session?.user) {
-          await hydrateUser(data.session.user);
+        // Vérifier d'abord si nous sommes déjà connectés
+        const { data: { session }, error } = await supabase.auth.getSession();
+        
+        if (error) {
+          console.error('Erreur lors de la vérification de session:', error);
+          setLoading(false);
+          return;
+        }
+
+        if (session) {
+          await hydrateUser(session.user);
+        } else {
+          setIsAuthenticated(false);
+          setCurrentUser(null);
         }
       } catch (error) {
-        console.error('Erreur initialisation session:', error);
+        console.error('Erreur inattendue:', error);
       } finally {
         setLoading(false);
       }
     };
 
-    initializeSession();
+    checkSession();
 
-    const { data: listener } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (!session?.user) {
-        setIsAuthenticated(false);
-        setCurrentUser(null);
-        setRequests([]);
-      } else {
-        await hydrateUser(session.user);
+    // Écouter les changements d'état d'authentification
+    const { data: authListener } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        console.log('Auth state change:', event);
+        
+        if (session) {
+          await hydrateUser(session.user);
+        } else {
+          setIsAuthenticated(false);
+          setCurrentUser(null);
+          setRequests([]);
+        }
+        setLoading(false);
       }
-    });
+    );
 
-    return () => listener?.subscription?.unsubscribe();
+    return () => {
+      authListener?.subscription?.unsubscribe();
+    };
   }, []);
 
   const hydrateUser = async (user) => {
@@ -81,13 +101,15 @@ export default function App() {
       let role = 'magasinier';
       let nom = user.email;
 
-      const { data: profile, error } = await supabase
+      const { data: profile, error: profileError } = await supabase
         .from('profiles')
         .select('role, nom')
         .eq('id', user.id)
         .maybeSingle();
 
-      if (error) throw error;
+      if (profileError) {
+        console.error('Erreur de profil:', profileError);
+      }
 
       if (profile) {
         role = profile.role || role;
@@ -97,46 +119,50 @@ export default function App() {
       setCurrentUser({ ...user, role, nom });
       setIsAuthenticated(true);
 
-      await loadRequests(role, user.id);
-      await loadNotifications(role);
+      // Charger les données
+      await Promise.all([
+        loadRequests(role, user.id),
+        loadNotifications(role)
+      ]);
+
+      // S'abonner aux mises à jour en temps réel
       subscribeRealtime(role, user.id);
+
     } catch (error) {
-      console.error('Erreur hydratation utilisateur:', error);
-      alert('Erreur de chargement du profil');
+      console.error('Erreur lors de l\'hydratation:', error);
+      alert('Erreur de chargement des données utilisateur');
     }
   };
 
   /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
     try {
-      let q = supabase
+      console.log('Chargement des demandes pour:', role, userId);
+      
+      let query = supabase
         .from('requests')
-        .select('*')
-        .order('date_creation', { ascending: false });
+        .select('*');
 
+      // Appliquer le filtre si magasinier
       if (role === 'magasinier') {
-        q = q.eq('user_id', userId);
+        query = query.eq('user_id', userId);
       }
 
-      const { data, error } = await q;
-      if (error) throw error;
+      // Trier par date de création descendante
+      query = query.order('created_at', { ascending: false });
+
+      const { data, error } = await query;
       
-      // Convert snake_case to camelCase for frontend
-      const formattedData = data?.map(item => ({
-        id: item.id,
-        dateDemande: item.date_demande,
-        departement: item.departement_concerner,
-        dateLivraisonSouhaitee: item.date_livraison_souhaitee,
-        userId: item.user_id,
-        articles: item.articles,
-        statut: item.statut,
-        urgent: item.urgent,
-        dateCreation: item.date_creation
-      })) || [];
-      
-      setRequests(formattedData);
+      if (error) {
+        console.error('Erreur lors du chargement des demandes:', error);
+        throw error;
+      }
+
+      console.log('Demandes chargées:', data?.length || 0);
+      setRequests(data || []);
     } catch (error) {
       console.error('Erreur chargement demandes:', error);
+      setRequests([]);
     }
   };
 
@@ -146,7 +172,7 @@ export default function App() {
         .from('notifications')
         .select('*')
         .eq('type', role)
-        .order('id', { ascending: false });
+        .order('created_at', { ascending: false });
       
       if (error) throw error;
       setNotifications(data || []);
@@ -157,67 +183,69 @@ export default function App() {
 
   /* ================= REALTIME ================= */
   const subscribeRealtime = (role, userId) => {
-    supabase.removeAllChannels();
+    try {
+      // Nettoyer les anciens canaux
+      const existingChannels = supabase.getChannels();
+      existingChannels.forEach(channel => {
+        supabase.removeChannel(channel);
+      });
 
-    const channel = supabase.channel('rt-requests')
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'requests',
-          filter: role === 'magasinier' ? `user_id=eq.${userId}` : undefined
-        },
-        async (payload) => {
-          const newRequest = payload.new;
-          const oldRequest = payload.old;
-          
-          // Format new request for frontend
-          const formattedRequest = newRequest ? {
-            id: newRequest.id,
-            dateDemande: newRequest.date_demande,
-            departement: newRequest.departement_concerner,
-            dateLivraisonSouhaitee: newRequest.date_livraison_souhaitee,
-            userId: newRequest.user_id,
-            articles: newRequest.articles,
-            statut: newRequest.statut,
-            urgent: newRequest.urgent,
-            dateCreation: newRequest.date_creation
-          } : null;
-          
-          setRequests(prev => {
-            switch (payload.eventType) {
-              case 'INSERT':
-                return [formattedRequest, ...prev];
-              case 'UPDATE':
-                return prev.map(req => 
-                  req.id === formattedRequest.id ? formattedRequest : req
-                );
-              case 'DELETE':
-                return prev.filter(req => req.id !== oldRequest.id);
-              default:
-                return prev;
+      // Créer un nouveau canal
+      const channel = supabase.channel('requests-channel')
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'requests'
+          },
+          (payload) => {
+            console.log('Changement détecté:', payload);
+            
+            // Si magasinier, filtrer par user_id
+            if (role === 'magasinier' && payload.new?.user_id !== userId) {
+              return;
             }
-          });
-        }
-      )
-      .subscribe();
-    
-    return () => {
-      supabase.removeChannel(channel);
-    };
+
+            setRequests(currentRequests => {
+              const existingIndex = currentRequests.findIndex(req => req.id === payload.new?.id);
+
+              switch (payload.eventType) {
+                case 'INSERT':
+                  return [payload.new, ...currentRequests];
+                
+                case 'UPDATE':
+                  if (existingIndex !== -1) {
+                    const updated = [...currentRequests];
+                    updated[existingIndex] = payload.new;
+                    return updated;
+                  }
+                  return [payload.new, ...currentRequests];
+                
+                case 'DELETE':
+                  return currentRequests.filter(req => req.id !== payload.old?.id);
+                
+                default:
+                  return currentRequests;
+              }
+            });
+          }
+        )
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    } catch (error) {
+      console.error('Erreur abonnement temps réel:', error);
+    }
   };
 
   /* ================= TELEGRAM NOTIFICATION ================= */
   const sendTelegramNotification = async (requestData) => {
     try {
-      const botToken = currentUser.role === 'magasinier' 
-        ? TELEGRAM_CONFIG.magasinierBotToken 
-        : TELEGRAM_CONFIG.acheteurBotToken;
-      
-      const chatId = currentUser.role === 'magasinier'
-        ? TELEGRAM_CONFIG.magasinierChatId
-        : TELEGRAM_CONFIG.acheteurChatId;
+      const botToken = TELEGRAM_CONFIG.acheteurBotToken;
+      const chatId = TELEGRAM_CONFIG.acheteurChatId;
 
       const urgentEmoji = requestData.urgent ? '🚨 ' : '';
       const urgentText = requestData.urgent ? '(URGENT) ' : '';
@@ -228,8 +256,8 @@ export default function App() {
 
       const message = `${urgentEmoji}*NOUVELLE DEMANDE ${urgentText}*
       
-*Département:* ${requestData.departement}
-*Date souhaitée:* ${requestData.dateLivraisonSouhaitee || 'Non spécifiée'}
+*Département:* ${requestData.departement_concerner}
+*Date souhaitée:* ${requestData.date_livraison_souhaitee || 'Non spécifiée'}
 *Urgent:* ${requestData.urgent ? 'OUI 🚨' : 'Non'}
 
 *Articles:*
@@ -257,6 +285,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
+      setLoading(true);
       const { error } = await supabase.auth.signInWithPassword({
         email: loginForm.username,
         password: loginForm.password
@@ -266,6 +295,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     } catch (error) {
       console.error('Erreur connexion:', error);
       alert('Identifiants incorrects');
+      setLoading(false);
     }
   };
 
@@ -327,7 +357,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
   const handleSubmitRequest = async () => {
     if (submitting) return;
     
-    // Validation
     if (!formData.departement_concerner.trim()) {
       alert('Veuillez saisir le département concerné');
       return;
@@ -350,7 +379,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         photo_url: null
       }));
 
-      // Préparer les données pour la base de données (snake_case)
+      // Préparer les données pour l'insertion
       const requestData = {
         date_demande: formData.date_demande,
         departement_concerner: formData.departement_concerner.trim(),
@@ -359,17 +388,24 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         articles: articlesWithoutPhotos,
         statut: 'En attente',
         urgent: formData.urgent,
-        date_creation: new Date().toISOString()
+        // created_at sera automatiquement rempli par la base de données
       };
 
-      // Insérer la demande initiale
+      console.log('Données à insérer:', requestData);
+
+      // Insérer la demande
       const { data: newRequest, error: insertError } = await supabase
         .from('requests')
         .insert([requestData])
         .select()
         .single();
 
-      if (insertError) throw insertError;
+      if (insertError) {
+        console.error('Erreur d\'insertion:', insertError);
+        throw insertError;
+      }
+
+      console.log('Demande insérée avec succès:', newRequest);
 
       // Uploader les photos si présentes
       const updatedArticles = [...articlesWithoutPhotos];
@@ -387,19 +423,20 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
       }
 
       // Mettre à jour la demande avec les URLs des photos
-      const { error: updateError } = await supabase
-        .from('requests')
-        .update({ articles: updatedArticles })
-        .eq('id', newRequest.id);
+      if (updatedArticles.some(article => article.photo_url)) {
+        const { error: updateError } = await supabase
+          .from('requests')
+          .update({ articles: updatedArticles })
+          .eq('id', newRequest.id);
 
-      if (updateError) throw updateError;
+        if (updateError) throw updateError;
+      }
 
       // Envoyer notification Telegram
-      const fullRequestData = {
+      await sendTelegramNotification({
         ...requestData,
         articles: updatedArticles
-      };
-      await sendTelegramNotification(fullRequestData);
+      });
 
       // Réinitialiser le formulaire
       setArticles([{ ...EMPTY_ARTICLE }]);
@@ -422,8 +459,11 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
   /* ================= LOADING STATE ================= */
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-indigo-700">
-        <div className="text-white">Chargement...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700">
+        <div className="text-white text-center">
+          <Loader2 className="animate-spin mx-auto mb-4" size={48} />
+          <p className="text-xl">Chargement...</p>
+        </div>
       </div>
     );
   }
@@ -482,9 +522,9 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
       {/* Header */}
       <header className="sticky top-0 bg-white shadow-sm p-4 flex justify-between items-center z-10">
         <div>
-          <p className="font-bold text-lg text-gray-900">{currentUser.nom}</p>
+          <p className="font-bold text-lg text-gray-900">{currentUser?.nom}</p>
           <p className="text-xs text-gray-500 uppercase tracking-wider">
-            {currentUser.role}
+            {currentUser?.role}
           </p>
         </div>
         <div className="flex items-center gap-4">
@@ -531,7 +571,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
       {/* Main Content */}
       <main className="max-w-6xl mx-auto p-4">
         {/* ===== MAGASINIER ===== */}
-        {currentUser.role === 'magasinier' && (
+        {currentUser?.role === 'magasinier' && (
           <div className="space-y-6">
             {/* Form Section */}
             <div className="bg-white rounded-2xl shadow-lg p-6">
@@ -706,7 +746,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       <div className="flex justify-between items-start">
                         <div>
                           <div className="flex items-center gap-2">
-                            <p className="font-medium text-gray-900">{request.departement}</p>
+                            <p className="font-medium text-gray-900">{request.departement_concerner}</p>
                             {request.urgent && (
                               <span className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded-full flex items-center gap-1">
                                 <AlertTriangle size={12} />
@@ -715,7 +755,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                             )}
                           </div>
                           <p className="text-sm text-gray-600">
-                            {new Date(request.dateDemande).toLocaleDateString()}
+                            {new Date(request.date_demande).toLocaleDateString()}
                           </p>
                           <p className="text-xs text-gray-500">
                             Statut : <span className="font-medium">{request.statut}</span>
@@ -724,6 +764,9 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         <div className="text-right">
                           <p className="text-xs text-gray-500">
                             {request.articles?.length || 0} article(s)
+                          </p>
+                          <p className="text-xs text-gray-400">
+                            {new Date(request.created_at).toLocaleDateString()}
                           </p>
                         </div>
                       </div>
@@ -736,7 +779,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         )}
 
         {/* ===== ACHETEUR ===== */}
-        {currentUser.role === 'acheteur' && (
+        {currentUser?.role === 'acheteur' && (
           <div className="space-y-6">
             <h2 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
               <Package className="text-green-600" />
@@ -770,10 +813,10 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       <div className="flex justify-between items-start">
                         <div>
                           <p className="font-bold text-lg text-gray-900">
-                            {request.departement}
+                            {request.departement_concerner}
                           </p>
                           <p className="text-sm text-gray-600">
-                            {new Date(request.dateDemande).toLocaleDateString()}
+                            {new Date(request.date_demande).toLocaleDateString()}
                           </p>
                         </div>
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${
@@ -790,8 +833,8 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         <div className="bg-gray-50 p-3 rounded-lg">
                           <p className="text-xs text-gray-500">Date livraison souhaitée</p>
                           <p className="font-medium text-gray-900">
-                            {request.dateLivraisonSouhaitee ? 
-                              new Date(request.dateLivraisonSouhaitee).toLocaleDateString() : 
+                            {request.date_livraison_souhaitee ? 
+                              new Date(request.date_livraison_souhaitee).toLocaleDateString() : 
                               'Non spécifiée'}
                           </p>
                         </div>
