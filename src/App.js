@@ -6,8 +6,7 @@ import {
   LogIn,
   LogOut,
   CheckCircle,
-  AlertTriangle,
-  Loader2
+  AlertTriangle
 } from 'lucide-react';
 import { supabase } from './supabaseClient';
 
@@ -47,57 +46,81 @@ export default function App() {
     urgent: false
   });
 
-  /* ================= SESSION ================= */
+  /* ================= SESSION - VERSION SIMPLIFIÉE ================= */
   useEffect(() => {
-    const checkSession = async () => {
+    let isMounted = true;
+
+    const initAuth = async () => {
       try {
-        // Vérifier d'abord si nous sommes déjà connectés
+        console.log('Initialisation de l\'authentification...');
+        
+        // Vérifier la session
         const { data: { session }, error } = await supabase.auth.getSession();
         
         if (error) {
-          console.error('Erreur lors de la vérification de session:', error);
+          console.error('Erreur session:', error);
+          if (isMounted) {
+            setIsAuthenticated(false);
+            setCurrentUser(null);
+            setLoading(false);
+          }
+          return;
+        }
+
+        if (!session) {
+          console.log('Aucune session trouvée');
+          if (isMounted) {
+            setIsAuthenticated(false);
+            setCurrentUser(null);
+            setLoading(false);
+          }
+          return;
+        }
+
+        console.log('Session trouvée:', session.user.email);
+        await handleUserSession(session.user);
+      } catch (error) {
+        console.error('Erreur initialisation:', error);
+        if (isMounted) {
+          setIsAuthenticated(false);
+          setCurrentUser(null);
+          setLoading(false);
+        }
+      }
+    };
+
+    initAuth();
+
+    // Écouter les changements d'authentification
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        console.log('Auth state change:', event);
+        
+        if (!isMounted) return;
+
+        if (!session) {
+          setIsAuthenticated(false);
+          setCurrentUser(null);
+          setRequests([]);
           setLoading(false);
           return;
         }
 
-        if (session) {
-          await hydrateUser(session.user);
-        } else {
-          setIsAuthenticated(false);
-          setCurrentUser(null);
-        }
-      } catch (error) {
-        console.error('Erreur inattendue:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    checkSession();
-
-    // Écouter les changements d'état d'authentification
-    const { data: authListener } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        console.log('Auth state change:', event);
-        
-        if (session) {
-          await hydrateUser(session.user);
-        } else {
-          setIsAuthenticated(false);
-          setCurrentUser(null);
-          setRequests([]);
-        }
-        setLoading(false);
+        await handleUserSession(session.user);
       }
     );
 
     return () => {
-      authListener?.subscription?.unsubscribe();
+      isMounted = false;
+      subscription?.unsubscribe();
     };
   }, []);
 
-  const hydrateUser = async (user) => {
+  const handleUserSession = async (user) => {
     try {
+      console.log('Traitement de l\'utilisateur:', user.email);
+      
+      // Récupérer le profil
       let role = 'magasinier';
       let nom = user.email;
 
@@ -107,57 +130,62 @@ export default function App() {
         .eq('id', user.id)
         .maybeSingle();
 
-      if (profileError) {
-        console.error('Erreur de profil:', profileError);
-      }
-
-      if (profile) {
+      if (!profileError && profile) {
         role = profile.role || role;
         nom = profile.nom || nom;
       }
 
+      console.log('Profil récupéré:', { role, nom });
+
+      // Mettre à jour l'état de l'utilisateur
       setCurrentUser({ ...user, role, nom });
       setIsAuthenticated(true);
 
       // Charger les données
-      await Promise.all([
-        loadRequests(role, user.id),
-        loadNotifications(role)
-      ]);
-
-      // S'abonner aux mises à jour en temps réel
-      subscribeRealtime(role, user.id);
+      await loadUserData(role, user.id);
 
     } catch (error) {
-      console.error('Erreur lors de l\'hydratation:', error);
-      alert('Erreur de chargement des données utilisateur');
+      console.error('Erreur handleUserSession:', error);
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadUserData = async (role, userId) => {
+    try {
+      console.log('Chargement des données pour:', role, userId);
+      
+      // Charger les demandes
+      await loadRequests(role, userId);
+      
+      // Charger les notifications
+      await loadNotifications(role);
+      
+      // S'abonner aux mises à jour
+      subscribeRealtime(role, userId);
+      
+    } catch (error) {
+      console.error('Erreur loadUserData:', error);
     }
   };
 
   /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
     try {
-      console.log('Chargement des demandes pour:', role, userId);
-      
       let query = supabase
         .from('requests')
         .select('*');
 
-      // Appliquer le filtre si magasinier
       if (role === 'magasinier') {
         query = query.eq('user_id', userId);
       }
 
-      // Trier par date de création descendante
-      query = query.order('created_at', { ascending: false });
-
-      const { data, error } = await query;
+      const { data, error } = await query.order('created_at', { ascending: false });
       
-      if (error) {
-        console.error('Erreur lors du chargement des demandes:', error);
-        throw error;
-      }
-
+      if (error) throw error;
+      
       console.log('Demandes chargées:', data?.length || 0);
       setRequests(data || []);
     } catch (error) {
@@ -184,13 +212,6 @@ export default function App() {
   /* ================= REALTIME ================= */
   const subscribeRealtime = (role, userId) => {
     try {
-      // Nettoyer les anciens canaux
-      const existingChannels = supabase.getChannels();
-      existingChannels.forEach(channel => {
-        supabase.removeChannel(channel);
-      });
-
-      // Créer un nouveau canal
       const channel = supabase.channel('requests-channel')
         .on(
           'postgres_changes',
@@ -200,33 +221,28 @@ export default function App() {
             table: 'requests'
           },
           (payload) => {
-            console.log('Changement détecté:', payload);
-            
-            // Si magasinier, filtrer par user_id
+            // Filtrer pour les magasiniers
             if (role === 'magasinier' && payload.new?.user_id !== userId) {
               return;
             }
 
-            setRequests(currentRequests => {
-              const existingIndex = currentRequests.findIndex(req => req.id === payload.new?.id);
-
+            setRequests(current => {
+              const index = current.findIndex(r => r.id === payload.new?.id);
+              
               switch (payload.eventType) {
                 case 'INSERT':
-                  return [payload.new, ...currentRequests];
-                
+                  return [payload.new, ...current];
                 case 'UPDATE':
-                  if (existingIndex !== -1) {
-                    const updated = [...currentRequests];
-                    updated[existingIndex] = payload.new;
+                  if (index !== -1) {
+                    const updated = [...current];
+                    updated[index] = payload.new;
                     return updated;
                   }
-                  return [payload.new, ...currentRequests];
-                
+                  return current;
                 case 'DELETE':
-                  return currentRequests.filter(req => req.id !== payload.old?.id);
-                
+                  return current.filter(r => r.id !== payload.old?.id);
                 default:
-                  return currentRequests;
+                  return current;
               }
             });
           }
@@ -241,51 +257,10 @@ export default function App() {
     }
   };
 
-  /* ================= TELEGRAM NOTIFICATION ================= */
-  const sendTelegramNotification = async (requestData) => {
-    try {
-      const botToken = TELEGRAM_CONFIG.acheteurBotToken;
-      const chatId = TELEGRAM_CONFIG.acheteurChatId;
-
-      const urgentEmoji = requestData.urgent ? '🚨 ' : '';
-      const urgentText = requestData.urgent ? '(URGENT) ' : '';
-      
-      const articlesText = requestData.articles?.map((article, idx) => 
-        `${idx + 1}. ${article.designation} - ${article.quantite} ${article.unite_mesure || ''}`
-      ).join('\n') || 'Aucun article';
-
-      const message = `${urgentEmoji}*NOUVELLE DEMANDE ${urgentText}*
-      
-*Département:* ${requestData.departement_concerner}
-*Date souhaitée:* ${requestData.date_livraison_souhaitee || 'Non spécifiée'}
-*Urgent:* ${requestData.urgent ? 'OUI 🚨' : 'Non'}
-
-*Articles:*
-${articlesText}
-
-${urgentEmoji}${urgentEmoji}${urgentText}`;
-
-      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: message,
-          parse_mode: 'Markdown'
-        })
-      });
-    } catch (error) {
-      console.error('Erreur envoi Telegram:', error);
-    }
-  };
-
   /* ================= AUTH ================= */
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
-      setLoading(true);
       const { error } = await supabase.auth.signInWithPassword({
         email: loginForm.username,
         password: loginForm.password
@@ -295,7 +270,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     } catch (error) {
       console.error('Erreur connexion:', error);
       alert('Identifiants incorrects');
-      setLoading(false);
     }
   };
 
@@ -304,52 +278,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
       await supabase.auth.signOut();
     } catch (error) {
       console.error('Erreur déconnexion:', error);
-    }
-  };
-
-  /* ================= ARTICLES ================= */
-  const addArticle = () => setArticles(p => [...p, { ...EMPTY_ARTICLE }]);
-  
-  const updateArticle = (index, field, value) => {
-    setArticles(p => {
-      const updated = [...p];
-      updated[index] = { ...updated[index], [field]: value };
-      return updated;
-    });
-  };
-
-  const removeArticle = (index) => {
-    if (articles.length > 1) {
-      setArticles(p => p.filter((_, idx) => idx !== index));
-    }
-  };
-
-  /* ================= PHOTO UPLOAD ================= */
-  const uploadArticlePhoto = async (file, requestId, index) => {
-    try {
-      const ext = file.name.split('.').pop();
-      const fileName = `${Date.now()}_${index}.${ext}`;
-      const path = `articles/${requestId}/${fileName}`;
-
-      const { error: uploadError } = await supabase
-        .storage
-        .from('articles')
-        .upload(path, file, { 
-          upsert: true,
-          contentType: file.type
-        });
-
-      if (uploadError) throw uploadError;
-
-      const { data: { publicUrl } } = supabase
-        .storage
-        .from('articles')
-        .getPublicUrl(path);
-
-      return publicUrl;
-    } catch (error) {
-      console.error('Erreur upload photo:', error);
-      return null;
     }
   };
 
@@ -371,7 +299,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     setSubmitting(true);
 
     try {
-      // Préparer les articles sans photos
       const articlesWithoutPhotos = validArticles.map(a => ({
         designation: a.designation.trim(),
         quantite: a.quantite || '1',
@@ -379,7 +306,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         photo_url: null
       }));
 
-      // Préparer les données pour l'insertion
       const requestData = {
         date_demande: formData.date_demande,
         departement_concerner: formData.departement_concerner.trim(),
@@ -387,57 +313,19 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         user_id: currentUser.id,
         articles: articlesWithoutPhotos,
         statut: 'En attente',
-        urgent: formData.urgent,
-        // created_at sera automatiquement rempli par la base de données
+        urgent: formData.urgent
       };
 
-      console.log('Données à insérer:', requestData);
-
-      // Insérer la demande
       const { data: newRequest, error: insertError } = await supabase
         .from('requests')
         .insert([requestData])
         .select()
         .single();
 
-      if (insertError) {
-        console.error('Erreur d\'insertion:', insertError);
-        throw insertError;
-      }
+      if (insertError) throw insertError;
 
-      console.log('Demande insérée avec succès:', newRequest);
-
-      // Uploader les photos si présentes
-      const updatedArticles = [...articlesWithoutPhotos];
-      for (let i = 0; i < validArticles.length; i++) {
-        if (validArticles[i].photo) {
-          const photoUrl = await uploadArticlePhoto(
-            validArticles[i].photo,
-            newRequest.id,
-            i
-          );
-          if (photoUrl) {
-            updatedArticles[i].photo_url = photoUrl;
-          }
-        }
-      }
-
-      // Mettre à jour la demande avec les URLs des photos
-      if (updatedArticles.some(article => article.photo_url)) {
-        const { error: updateError } = await supabase
-          .from('requests')
-          .update({ articles: updatedArticles })
-          .eq('id', newRequest.id);
-
-        if (updateError) throw updateError;
-      }
-
-      // Envoyer notification Telegram
-      await sendTelegramNotification({
-        ...requestData,
-        articles: updatedArticles
-      });
-
+      alert('✅ Demande envoyée avec succès !');
+      
       // Réinitialiser le formulaire
       setArticles([{ ...EMPTY_ARTICLE }]);
       setFormData({
@@ -447,7 +335,9 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         urgent: false
       });
 
-      alert('✅ Demande envoyée avec succès !');
+      // Recharger les demandes
+      await loadRequests(currentUser.role, currentUser.id);
+
     } catch (error) {
       console.error('Erreur soumission demande:', error);
       alert('❌ Erreur lors de l\'envoi de la demande');
@@ -456,19 +346,18 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     }
   };
 
-  /* ================= LOADING STATE ================= */
+  /* ================= LOGIN UI ================= */
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700">
-        <div className="text-white text-center">
-          <Loader2 className="animate-spin mx-auto mb-4" size={48} />
-          <p className="text-xl">Chargement...</p>
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-white mx-auto mb-4"></div>
+          <p className="text-white text-lg">Chargement...</p>
         </div>
       </div>
     );
   }
 
-  /* ================= LOGIN UI ================= */
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700 p-4">
@@ -519,7 +408,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
   /* ================= MAIN UI ================= */
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
       <header className="sticky top-0 bg-white shadow-sm p-4 flex justify-between items-center z-10">
         <div>
           <p className="font-bold text-lg text-gray-900">{currentUser?.nom}</p>
@@ -527,60 +415,25 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
             {currentUser?.role}
           </p>
         </div>
-        <div className="flex items-center gap-4">
-          {notifications.length > 0 && (
-            <button 
-              onClick={() => setShowNotifications(!showNotifications)}
-              className="relative p-2 hover:bg-gray-100 rounded-full"
-            >
-              <Bell size={22} className="text-gray-700" />
-              <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
-                {notifications.length}
-              </span>
-            </button>
-          )}
-          <button 
-            onClick={handleLogout}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
-          >
-            <LogOut size={18} />
-            <span className="hidden sm:inline">Déconnexion</span>
-          </button>
-        </div>
+        <button 
+          onClick={handleLogout}
+          className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
+        >
+          <LogOut size={18} />
+          <span className="hidden sm:inline">Déconnexion</span>
+        </button>
       </header>
 
-      {/* Notifications Panel */}
-      {showNotifications && notifications.length > 0 && (
-        <div className="absolute right-4 top-16 bg-white rounded-xl shadow-xl border w-80 z-20 max-h-96 overflow-y-auto">
-          <div className="p-4 border-b">
-            <h3 className="font-bold text-gray-900">Notifications</h3>
-          </div>
-          <div className="p-2">
-            {notifications.map(notif => (
-              <div key={notif.id} className="p-3 hover:bg-gray-50 rounded-lg">
-                <p className="text-sm text-gray-800">{notif.message}</p>
-                <p className="text-xs text-gray-500 mt-1">
-                  {new Date(notif.created_at).toLocaleDateString()}
-                </p>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Main Content */}
       <main className="max-w-6xl mx-auto p-4">
         {/* ===== MAGASINIER ===== */}
         {currentUser?.role === 'magasinier' && (
           <div className="space-y-6">
-            {/* Form Section */}
             <div className="bg-white rounded-2xl shadow-lg p-6">
               <h2 className="text-2xl font-bold text-gray-900 mb-6 flex items-center gap-2">
                 <ShoppingCart className="text-indigo-600" />
                 Nouvelle demande d'achat
               </h2>
 
-              {/* Form Fields */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -633,7 +486,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                 </div>
               </div>
 
-              {/* Articles List */}
               <div className="space-y-4 mb-6">
                 <h3 className="font-bold text-gray-900">Articles demandés</h3>
                 
@@ -645,7 +497,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       </h4>
                       {articles.length > 1 && (
                         <button
-                          onClick={() => removeArticle(index)}
+                          onClick={() => setArticles(p => p.filter((_, idx) => idx !== index))}
                           className="text-red-600 hover:text-red-800 text-sm"
                         >
                           Supprimer
@@ -657,7 +509,11 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       placeholder="Désignation *"
                       className="w-full p-3 border border-gray-300 rounded-lg"
                       value={article.designation}
-                      onChange={e => updateArticle(index, 'designation', e.target.value)}
+                      onChange={e => {
+                        const newArticles = [...articles];
+                        newArticles[index].designation = e.target.value;
+                        setArticles(newArticles);
+                      }}
                       required
                     />
 
@@ -669,7 +525,11 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                           min="1"
                           className="w-full p-3 border border-gray-300 rounded-lg"
                           value={article.quantite}
-                          onChange={e => updateArticle(index, 'quantite', e.target.value)}
+                          onChange={e => {
+                            const newArticles = [...articles];
+                            newArticles[index].quantite = e.target.value;
+                            setArticles(newArticles);
+                          }}
                         />
                       </div>
                       <div>
@@ -677,12 +537,15 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                           placeholder="Unité de mesure (kg, L, Pièces, etc.)"
                           className="w-full p-3 border border-gray-300 rounded-lg"
                           value={article.unite_mesure}
-                          onChange={e => updateArticle(index, 'unite_mesure', e.target.value)}
+                          onChange={e => {
+                            const newArticles = [...articles];
+                            newArticles[index].unite_mesure = e.target.value;
+                            setArticles(newArticles);
+                          }}
                         />
                       </div>
                     </div>
 
-                    {/* Photo Upload */}
                     <div className="space-y-2">
                       <label className="block text-sm font-medium text-gray-700">
                         Photo (optionnel)
@@ -691,11 +554,14 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         type="file"
                         accept="image/*"
                         className="w-full p-2 border border-gray-300 rounded-lg"
-                        onChange={e => updateArticle(index, 'photo', e.target.files[0])}
+                        onChange={e => {
+                          const newArticles = [...articles];
+                          newArticles[index].photo = e.target.files[0];
+                          setArticles(newArticles);
+                        }}
                       />
                       {article.photo && (
                         <div className="mt-2">
-                          <p className="text-sm text-gray-600 mb-2">Aperçu :</p>
                           <img
                             src={URL.createObjectURL(article.photo)}
                             alt="Preview"
@@ -708,10 +574,9 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                 ))}
               </div>
 
-              {/* Actions */}
               <div className="flex flex-col sm:flex-row gap-3">
                 <button
-                  onClick={addArticle}
+                  onClick={() => setArticles([...articles, { ...EMPTY_ARTICLE }])}
                   className="px-6 py-3 border-2 border-indigo-600 text-indigo-600 rounded-lg hover:bg-indigo-50 transition-colors"
                 >
                   + Ajouter un autre article
@@ -727,7 +592,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
               </div>
             </div>
 
-            {/* History Section */}
             <div className="bg-white rounded-2xl shadow-lg p-6">
               <h3 className="text-xl font-bold text-gray-900 mb-4">Historique des demandes</h3>
               {requests.length === 0 ? (
@@ -764,9 +628,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         <div className="text-right">
                           <p className="text-xs text-gray-500">
                             {request.articles?.length || 0} article(s)
-                          </p>
-                          <p className="text-xs text-gray-400">
-                            {new Date(request.created_at).toLocaleDateString()}
                           </p>
                         </div>
                       </div>
@@ -809,7 +670,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                     )}
                     
                     <div className="p-6 space-y-4">
-                      {/* Header */}
                       <div className="flex justify-between items-start">
                         <div>
                           <p className="font-bold text-lg text-gray-900">
@@ -828,7 +688,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         </span>
                       </div>
 
-                      {/* Details */}
                       <div className="grid grid-cols-2 gap-4">
                         <div className="bg-gray-50 p-3 rounded-lg">
                           <p className="text-xs text-gray-500">Date livraison souhaitée</p>
@@ -848,7 +707,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         </div>
                       </div>
 
-                      {/* Articles */}
                       <div className="border-t pt-4">
                         <p className="font-medium text-gray-900 mb-3">Articles :</p>
                         <div className="space-y-3">
@@ -861,21 +719,11 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                                   <span>Unité: {article.unite_mesure}</span>
                                 )}
                               </div>
-                              {article.photo_url && (
-                                <div className="mt-2">
-                                  <img
-                                    src={article.photo_url}
-                                    alt={article.designation}
-                                    className="h-24 w-auto object-cover rounded border"
-                                  />
-                                </div>
-                              )}
                             </div>
                           ))}
                         </div>
                       </div>
 
-                      {/* Actions */}
                       <div className="flex gap-3 pt-4 border-t">
                         <button className="flex-1 bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 flex items-center justify-center gap-2">
                           <CheckCircle size={18} />
