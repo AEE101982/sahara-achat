@@ -32,6 +32,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [tableSchema, setTableSchema] = useState(null);
 
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [requests, setRequests] = useState([]);
@@ -39,18 +40,77 @@ export default function App() {
   const [showNotifications, setShowNotifications] = useState(false);
 
   const [articles, setArticles] = useState([{ ...EMPTY_ARTICLE }]);
+  // Utiliser le bon nom de colonne basé sur le schéma détecté
   const [formData, setFormData] = useState({
-    // Date de demande fixée à aujourd'hui et non modifiable
+    // Le nom réel sera déterminé par detectTableSchema()
     date_demande: new Date().toISOString().split('T')[0],
     departement_concerner: '',
     date_livraison_souhaitee: '',
     urgent: false
   });
 
+  /* ================= DÉTECTER LE SCHÉMA DE LA TABLE ================= */
+  const detectTableSchema = async () => {
+    try {
+      console.log('Détection du schéma de la table requests...');
+      
+      // Méthode 1: Vérifier les colonnes via une requête SELECT limitée
+      const { data: sampleData, error: sampleError } = await supabase
+        .from('requests')
+        .select('*')
+        .limit(1);
+      
+      if (!sampleError && sampleData && sampleData.length > 0) {
+        const firstRow = sampleData[0];
+        console.log('Structure détectée:', Object.keys(firstRow));
+        
+        // Trouver le nom correct de la colonne date
+        const dateColumns = Object.keys(firstRow).filter(key => 
+          key.toLowerCase().includes('date') && key.toLowerCase().includes('demande')
+        );
+        
+        if (dateColumns.length > 0) {
+          console.log('Colonne date trouvée:', dateColumns[0]);
+          return {
+            dateColumn: dateColumns[0],
+            departementColumn: Object.keys(firstRow).find(key => 
+              key.toLowerCase().includes('departement') || key.toLowerCase().includes('nom')
+            ) || 'departement_concerner',
+            livraisonColumn: Object.keys(firstRow).find(key => 
+              key.toLowerCase().includes('livraison') || key.toLowerCase().includes('souhaitee')
+            ) || 'date_livraison_souhaitee'
+          };
+        }
+      }
+      
+      // Méthode 2: Essayer avec des noms communs
+      console.log('Essai avec des noms de colonnes courants...');
+      return {
+        dateColumn: 'date_demande',
+        departementColumn: 'departement',
+        livraisonColumn: 'date_livraison'
+      };
+      
+    } catch (error) {
+      console.error('Erreur détection schéma:', error);
+      return {
+        dateColumn: 'date_demande',
+        departementColumn: 'departement_concerner',
+        livraisonColumn: 'date_livraison_souhaitee'
+      };
+    }
+  };
+
   /* ================= SESSION ================= */
   useEffect(() => {
-    const checkAuth = async () => {
+    const initApp = async () => {
       try {
+        // Détecter le schéma de la table
+        const schema = await detectTableSchema();
+        setTableSchema(schema);
+        console.log('Schéma détecté:', schema);
+
+        // Vérifier l'authentification
         const { data: { session } } = await supabase.auth.getSession();
         
         if (session) {
@@ -60,16 +120,18 @@ export default function App() {
           setCurrentUser(null);
         }
       } catch (error) {
-        console.error('Erreur session:', error);
+        console.error('Erreur initialisation:', error);
       } finally {
         setLoading(false);
       }
     };
 
-    checkAuth();
+    initApp();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, session) => {
+        console.log('Changement auth:', event);
+        
         if (session) {
           await hydrateUser(session.user);
         } else {
@@ -114,9 +176,7 @@ export default function App() {
   /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
     try {
-      let query = supabase
-        .from('requests')
-        .select('*');
+      let query = supabase.from('requests').select('*');
 
       if (role === 'magasinier') {
         query = query.eq('user_id', userId);
@@ -124,11 +184,18 @@ export default function App() {
 
       const { data, error } = await query.order('created_at', { ascending: false });
       
-      if (error) throw error;
-      
-      setRequests(data || []);
+      if (error) {
+        console.error('Erreur chargement demandes:', error);
+        // Essayer sans le tri si created_at n'existe pas
+        const { data: data2, error: error2 } = await query;
+        if (error2) throw error2;
+        setRequests(data2 || []);
+      } else {
+        setRequests(data || []);
+      }
     } catch (error) {
-      console.error('Erreur chargement demandes:', error);
+      console.error('Erreur critique chargement demandes:', error);
+      setRequests([]);
     }
   };
 
@@ -330,7 +397,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     setSubmitting(true);
 
     try {
-      // Préparer les articles (sans photos pour l'instant)
+      // Préparer les articles
       const articlesWithoutPhotos = validArticles.map(a => ({
         designation: a.designation.trim(),
         quantite: a.quantite || '1',
@@ -338,78 +405,102 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
         photo_url: null
       }));
 
+      // Préparer les données avec les bons noms de colonnes
       const requestData = {
-        date_demande: formData.date_demande, // Date fixe (aujourd'hui)
-        departement_concerner: formData.departement_concerner.trim(),
-        date_livraison_souhaitee: formData.date_livraison_souhaitee || null,
+        [tableSchema?.dateColumn || 'date_demande']: formData.date_demande,
+        [tableSchema?.departementColumn || 'departement_concerner']: formData.departement_concerner.trim(),
+        [tableSchema?.livraisonColumn || 'date_livraison_souhaitee']: formData.date_livraison_souhaitee || null,
         user_id: currentUser.id,
         articles: articlesWithoutPhotos,
         statut: 'En attente',
         urgent: formData.urgent
       };
 
+      console.log('Données à insérer:', requestData);
+
+      // Insérer la demande
       const { data: newRequest, error: insertError } = await supabase
         .from('requests')
         .insert([requestData])
         .select()
         .single();
 
-      if (insertError) throw insertError;
+      if (insertError) {
+        console.error('Erreur détaillée:', insertError);
+        
+        // Essayer avec un schéma alternatif
+        const fallbackData = {
+          dateDemande: formData.date_demande,
+          departement: formData.departement_concerner.trim(),
+          dateLivraison: formData.date_livraison_souhaitee || null,
+          user_id: currentUser.id,
+          articles: articlesWithoutPhotos,
+          statut: 'En attente',
+          urgent: formData.urgent
+        };
 
-      // Uploader les photos seulement si elles existent (facultatif)
-      const updatedArticles = [...articlesWithoutPhotos];
-      let hasPhotos = false;
-      
-      for (let i = 0; i < validArticles.length; i++) {
-        if (validArticles[i].photo) {
-          const photoUrl = await uploadArticlePhoto(
-            validArticles[i].photo,
-            newRequest.id,
-            i
-          );
-          if (photoUrl) {
-            updatedArticles[i].photo_url = photoUrl;
-            hasPhotos = true;
-          }
-        }
-      }
-
-      // Mettre à jour seulement si des photos ont été uploadées
-      if (hasPhotos) {
-        const { error: updateError } = await supabase
+        console.log('Essai avec schéma alternatif:', fallbackData);
+        
+        const { data: fallbackRequest, error: fallbackError } = await supabase
           .from('requests')
-          .update({ articles: updatedArticles })
-          .eq('id', newRequest.id);
+          .insert([fallbackData])
+          .select()
+          .single();
 
-        if (updateError) throw updateError;
+        if (fallbackError) {
+          console.error('Erreur schéma alternatif:', fallbackError);
+          throw fallbackError;
+        }
+
+        console.log('Insertion réussie avec schéma alternatif');
+      } else {
+        console.log('Insertion réussie avec schéma détecté');
       }
 
-      // Envoyer notification Telegram
-      await sendTelegramNotification({
-        ...requestData,
-        articles: hasPhotos ? updatedArticles : articlesWithoutPhotos
-      });
-
+      alert('✅ Demande envoyée avec succès !');
+      
       // Réinitialiser le formulaire
       setArticles([{ ...EMPTY_ARTICLE }]);
       setFormData({
-        date_demande: new Date().toISOString().split('T')[0], // Réinitialiser à aujourd'hui
+        date_demande: new Date().toISOString().split('T')[0],
         departement_concerner: '',
         date_livraison_souhaitee: '',
         urgent: false
       });
 
-      alert('✅ Demande envoyée avec succès !');
-      
       // Recharger les demandes
       await loadRequests(currentUser.role, currentUser.id);
 
     } catch (error) {
       console.error('Erreur soumission demande:', error);
-      alert('❌ Erreur lors de l\'envoi de la demande');
+      alert('❌ Erreur lors de l\'envoi de la demande. Vérifiez la console pour plus de détails.');
     } finally {
       setSubmitting(false);
     }
+  };
+
+  /* ================= AFFICHAGE DE LA DATE DE DEMANDE ================= */
+  const getDateDisplayValue = (request) => {
+    if (!request) return '';
+    
+    // Essayer différents noms de colonnes
+    if (request.date_demande) return request.date_demande;
+    if (request.dateDemande) return request.dateDemande;
+    if (request.date) return request.date;
+    if (request.created_at) return request.created_at.split('T')[0];
+    
+    return '';
+  };
+
+  const getDepartementDisplayValue = (request) => {
+    if (!request) return '';
+    
+    if (request.departement_concerner) return request.departement_concerner;
+    if (request.departement) return request.departement;
+    if (request.departementConcerner) return request.departementConcerner;
+    if (request.nom_demandeur) return request.nom_demandeur;
+    
+    return '';
   };
 
   /* ================= LOADING STATE ================= */
@@ -622,15 +713,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                             src={URL.createObjectURL(article.photo)}
                             alt="Preview"
                             className="h-32 w-auto object-cover rounded-lg border"
-                            onLoad={(e) => URL.revokeObjectURL(e.target.src)}
                           />
-                          <button
-                            type="button"
-                            onClick={() => updateArticle(index, 'photo', null)}
-                            className="mt-2 text-sm text-red-600 hover:text-red-800"
-                          >
-                            Supprimer la photo
-                          </button>
                         </div>
                       )}
                     </div>
@@ -674,7 +757,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       <div className="flex justify-between items-start">
                         <div>
                           <div className="flex items-center gap-2">
-                            <p className="font-medium text-gray-900">{request.departement_concerner}</p>
+                            <p className="font-medium text-gray-900">{getDepartementDisplayValue(request)}</p>
                             {request.urgent && (
                               <span className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded-full flex items-center gap-1">
                                 <AlertTriangle size={12} />
@@ -683,19 +766,16 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                             )}
                           </div>
                           <p className="text-sm text-gray-600">
-                            Date: {new Date(request.date_demande).toLocaleDateString()}
+                            Date: {getDateDisplayValue(request) ? new Date(getDateDisplayValue(request)).toLocaleDateString() : 'Date inconnue'}
                           </p>
                           <p className="text-xs text-gray-500">
-                            Statut : <span className="font-medium">{request.statut}</span>
+                            Statut : <span className="font-medium">{request.statut || 'En attente'}</span>
                           </p>
                         </div>
                         <div className="text-right">
                           <p className="text-xs text-gray-500">
                             {request.articles?.length || 0} article(s)
                           </p>
-                          {request.articles?.some(a => a.photo_url) && (
-                            <p className="text-xs text-blue-600 mt-1">📷 Avec photo</p>
-                          )}
                         </div>
                       </div>
                     </div>
@@ -740,10 +820,10 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       <div className="flex justify-between items-start">
                         <div>
                           <p className="font-bold text-lg text-gray-900">
-                            {request.departement_concerner}
+                            {getDepartementDisplayValue(request)}
                           </p>
                           <p className="text-sm text-gray-600">
-                            Date demande: {new Date(request.date_demande).toLocaleDateString()}
+                            Date: {getDateDisplayValue(request) ? new Date(getDateDisplayValue(request)).toLocaleDateString() : 'Date inconnue'}
                           </p>
                         </div>
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${
@@ -751,7 +831,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                           request.statut === 'Refusé' ? 'bg-red-100 text-red-800' :
                           'bg-yellow-100 text-yellow-800'
                         }`}>
-                          {request.statut}
+                          {request.statut || 'En attente'}
                         </span>
                       </div>
 
@@ -779,29 +859,13 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                         <div className="space-y-3">
                           {request.articles?.map((article, idx) => (
                             <div key={idx} className="bg-gray-50 rounded-lg p-3">
-                              <div className="flex justify-between items-start">
-                                <div>
-                                  <p className="font-medium text-gray-900">{article.designation}</p>
-                                  <div className="flex gap-4 text-sm text-gray-600 mt-2">
-                                    <span>Qté: {article.quantite || '1'}</span>
-                                    {article.unite_mesure && (
-                                      <span>Unité: {article.unite_mesure}</span>
-                                    )}
-                                  </div>
-                                </div>
-                                {article.photo_url && (
-                                  <span className="text-blue-600 text-xs">📷</span>
+                              <p className="font-medium text-gray-900">{article.designation}</p>
+                              <div className="flex justify-between text-sm text-gray-600 mt-2">
+                                <span>Quantité: {article.quantite || '1'}</span>
+                                {article.unite_mesure && (
+                                  <span>Unité: {article.unite_mesure}</span>
                                 )}
                               </div>
-                              {article.photo_url && (
-                                <div className="mt-2">
-                                  <img
-                                    src={article.photo_url}
-                                    alt={article.designation}
-                                    className="h-24 w-auto object-cover rounded border"
-                                  />
-                                </div>
-                              )}
                             </div>
                           ))}
                         </div>
