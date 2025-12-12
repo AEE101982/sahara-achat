@@ -40,134 +40,74 @@ export default function App() {
 
   const [articles, setArticles] = useState([{ ...EMPTY_ARTICLE }]);
   const [formData, setFormData] = useState({
+    // Date de demande fixée à aujourd'hui et non modifiable
     date_demande: new Date().toISOString().split('T')[0],
     departement_concerner: '',
     date_livraison_souhaitee: '',
     urgent: false
   });
 
-  /* ================= SESSION - VERSION SIMPLIFIÉE ================= */
+  /* ================= SESSION ================= */
   useEffect(() => {
-    let isMounted = true;
-
-    const initAuth = async () => {
+    const checkAuth = async () => {
       try {
-        console.log('Initialisation de l\'authentification...');
+        const { data: { session } } = await supabase.auth.getSession();
         
-        // Vérifier la session
-        const { data: { session }, error } = await supabase.auth.getSession();
-        
-        if (error) {
-          console.error('Erreur session:', error);
-          if (isMounted) {
-            setIsAuthenticated(false);
-            setCurrentUser(null);
-            setLoading(false);
-          }
-          return;
-        }
-
-        if (!session) {
-          console.log('Aucune session trouvée');
-          if (isMounted) {
-            setIsAuthenticated(false);
-            setCurrentUser(null);
-            setLoading(false);
-          }
-          return;
-        }
-
-        console.log('Session trouvée:', session.user.email);
-        await handleUserSession(session.user);
-      } catch (error) {
-        console.error('Erreur initialisation:', error);
-        if (isMounted) {
+        if (session) {
+          await hydrateUser(session.user);
+        } else {
           setIsAuthenticated(false);
           setCurrentUser(null);
-          setLoading(false);
         }
+      } catch (error) {
+        console.error('Erreur session:', error);
+      } finally {
+        setLoading(false);
       }
     };
 
-    initAuth();
+    checkAuth();
 
-    // Écouter les changements d'authentification
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, session) => {
-        console.log('Auth state change:', event);
-        
-        if (!isMounted) return;
-
-        if (!session) {
+        if (session) {
+          await hydrateUser(session.user);
+        } else {
           setIsAuthenticated(false);
           setCurrentUser(null);
           setRequests([]);
-          setLoading(false);
-          return;
         }
-
-        await handleUserSession(session.user);
+        setLoading(false);
       }
     );
 
-    return () => {
-      isMounted = false;
-      subscription?.unsubscribe();
-    };
+    return () => subscription.unsubscribe();
   }, []);
 
-  const handleUserSession = async (user) => {
+  const hydrateUser = async (user) => {
     try {
-      console.log('Traitement de l\'utilisateur:', user.email);
-      
-      // Récupérer le profil
       let role = 'magasinier';
       let nom = user.email;
 
-      const { data: profile, error: profileError } = await supabase
+      const { data: profile } = await supabase
         .from('profiles')
         .select('role, nom')
         .eq('id', user.id)
         .maybeSingle();
 
-      if (!profileError && profile) {
+      if (profile) {
         role = profile.role || role;
         nom = profile.nom || nom;
       }
 
-      console.log('Profil récupéré:', { role, nom });
-
-      // Mettre à jour l'état de l'utilisateur
       setCurrentUser({ ...user, role, nom });
       setIsAuthenticated(true);
 
-      // Charger les données
-      await loadUserData(role, user.id);
-
-    } catch (error) {
-      console.error('Erreur handleUserSession:', error);
-      setIsAuthenticated(false);
-      setCurrentUser(null);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadUserData = async (role, userId) => {
-    try {
-      console.log('Chargement des données pour:', role, userId);
-      
-      // Charger les demandes
-      await loadRequests(role, userId);
-      
-      // Charger les notifications
+      await loadRequests(role, user.id);
       await loadNotifications(role);
-      
-      // S'abonner aux mises à jour
-      subscribeRealtime(role, userId);
-      
+      subscribeRealtime(role, user.id);
     } catch (error) {
-      console.error('Erreur loadUserData:', error);
+      console.error('Erreur hydratation:', error);
     }
   };
 
@@ -186,11 +126,9 @@ export default function App() {
       
       if (error) throw error;
       
-      console.log('Demandes chargées:', data?.length || 0);
       setRequests(data || []);
     } catch (error) {
       console.error('Erreur chargement demandes:', error);
-      setRequests([]);
     }
   };
 
@@ -221,7 +159,6 @@ export default function App() {
             table: 'requests'
           },
           (payload) => {
-            // Filtrer pour les magasiniers
             if (role === 'magasinier' && payload.new?.user_id !== userId) {
               return;
             }
@@ -257,10 +194,52 @@ export default function App() {
     }
   };
 
+  /* ================= TELEGRAM NOTIFICATION ================= */
+  const sendTelegramNotification = async (requestData) => {
+    try {
+      const botToken = TELEGRAM_CONFIG.acheteurBotToken;
+      const chatId = TELEGRAM_CONFIG.acheteurChatId;
+
+      const urgentEmoji = requestData.urgent ? '🚨 ' : '';
+      const urgentText = requestData.urgent ? '(URGENT) ' : '';
+      
+      const articlesText = requestData.articles?.map((article, idx) => 
+        `${idx + 1}. ${article.designation} - ${article.quantite} ${article.unite_mesure || ''}`
+      ).join('\n') || 'Aucun article';
+
+      const message = `${urgentEmoji}*NOUVELLE DEMANDE ${urgentText}*
+      
+*Département:* ${requestData.departement_concerner}
+*Date demande:* ${requestData.date_demande}
+*Date souhaitée:* ${requestData.date_livraison_souhaitee || 'Non spécifiée'}
+*Urgent:* ${requestData.urgent ? 'OUI 🚨' : 'Non'}
+
+*Articles:*
+${articlesText}
+
+${urgentEmoji}${urgentEmoji}${urgentText}`;
+
+      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'Markdown'
+        })
+      });
+    } catch (error) {
+      console.error('Erreur envoi Telegram:', error);
+    }
+  };
+
   /* ================= AUTH ================= */
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
+      setLoading(true);
       const { error } = await supabase.auth.signInWithPassword({
         email: loginForm.username,
         password: loginForm.password
@@ -270,6 +249,7 @@ export default function App() {
     } catch (error) {
       console.error('Erreur connexion:', error);
       alert('Identifiants incorrects');
+      setLoading(false);
     }
   };
 
@@ -278,6 +258,57 @@ export default function App() {
       await supabase.auth.signOut();
     } catch (error) {
       console.error('Erreur déconnexion:', error);
+    }
+  };
+
+  /* ================= ARTICLES ================= */
+  const addArticle = () => setArticles(p => [...p, { ...EMPTY_ARTICLE }]);
+  
+  const updateArticle = (index, field, value) => {
+    setArticles(p => {
+      const updated = [...p];
+      updated[index] = { ...updated[index], [field]: value };
+      return updated;
+    });
+  };
+
+  const removeArticle = (index) => {
+    if (articles.length > 1) {
+      setArticles(p => p.filter((_, idx) => idx !== index));
+    }
+  };
+
+  /* ================= PHOTO UPLOAD (FACULTATIF) ================= */
+  const uploadArticlePhoto = async (file, requestId, index) => {
+    if (!file) return null;
+    
+    try {
+      const ext = file.name.split('.').pop();
+      const fileName = `${Date.now()}_${index}.${ext}`;
+      const path = `articles/${requestId}/${fileName}`;
+
+      const { error: uploadError } = await supabase
+        .storage
+        .from('articles')
+        .upload(path, file, { 
+          upsert: true,
+          contentType: file.type
+        });
+
+      if (uploadError) {
+        console.error('Erreur upload:', uploadError);
+        return null;
+      }
+
+      const { data: { publicUrl } } = supabase
+        .storage
+        .from('articles')
+        .getPublicUrl(path);
+
+      return publicUrl;
+    } catch (error) {
+      console.error('Erreur upload photo:', error);
+      return null;
     }
   };
 
@@ -299,6 +330,7 @@ export default function App() {
     setSubmitting(true);
 
     try {
+      // Préparer les articles (sans photos pour l'instant)
       const articlesWithoutPhotos = validArticles.map(a => ({
         designation: a.designation.trim(),
         quantite: a.quantite || '1',
@@ -307,7 +339,7 @@ export default function App() {
       }));
 
       const requestData = {
-        date_demande: formData.date_demande,
+        date_demande: formData.date_demande, // Date fixe (aujourd'hui)
         departement_concerner: formData.departement_concerner.trim(),
         date_livraison_souhaitee: formData.date_livraison_souhaitee || null,
         user_id: currentUser.id,
@@ -324,17 +356,51 @@ export default function App() {
 
       if (insertError) throw insertError;
 
-      alert('✅ Demande envoyée avec succès !');
+      // Uploader les photos seulement si elles existent (facultatif)
+      const updatedArticles = [...articlesWithoutPhotos];
+      let hasPhotos = false;
       
+      for (let i = 0; i < validArticles.length; i++) {
+        if (validArticles[i].photo) {
+          const photoUrl = await uploadArticlePhoto(
+            validArticles[i].photo,
+            newRequest.id,
+            i
+          );
+          if (photoUrl) {
+            updatedArticles[i].photo_url = photoUrl;
+            hasPhotos = true;
+          }
+        }
+      }
+
+      // Mettre à jour seulement si des photos ont été uploadées
+      if (hasPhotos) {
+        const { error: updateError } = await supabase
+          .from('requests')
+          .update({ articles: updatedArticles })
+          .eq('id', newRequest.id);
+
+        if (updateError) throw updateError;
+      }
+
+      // Envoyer notification Telegram
+      await sendTelegramNotification({
+        ...requestData,
+        articles: hasPhotos ? updatedArticles : articlesWithoutPhotos
+      });
+
       // Réinitialiser le formulaire
       setArticles([{ ...EMPTY_ARTICLE }]);
       setFormData({
-        date_demande: new Date().toISOString().split('T')[0],
+        date_demande: new Date().toISOString().split('T')[0], // Réinitialiser à aujourd'hui
         departement_concerner: '',
         date_livraison_souhaitee: '',
         urgent: false
       });
 
+      alert('✅ Demande envoyée avec succès !');
+      
       // Recharger les demandes
       await loadRequests(currentUser.role, currentUser.id);
 
@@ -346,7 +412,7 @@ export default function App() {
     }
   };
 
-  /* ================= LOGIN UI ================= */
+  /* ================= LOADING STATE ================= */
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700">
@@ -358,6 +424,7 @@ export default function App() {
     );
   }
 
+  /* ================= LOGIN UI ================= */
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700 p-4">
@@ -441,10 +508,12 @@ export default function App() {
                   </label>
                   <input
                     type="date"
-                    className="w-full p-3 border border-gray-300 rounded-lg"
+                    className="w-full p-3 border border-gray-300 rounded-lg bg-gray-50 cursor-not-allowed"
                     value={formData.date_demande}
-                    onChange={e => setFormData({ ...formData, date_demande: e.target.value })}
+                    readOnly
+                    disabled
                   />
+                  <p className="text-xs text-gray-500 mt-1">Date automatique (non modifiable)</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -468,6 +537,7 @@ export default function App() {
                     className="w-full p-3 border border-gray-300 rounded-lg"
                     value={formData.date_livraison_souhaitee}
                     onChange={e => setFormData({ ...formData, date_livraison_souhaitee: e.target.value })}
+                    min={formData.date_demande}
                   />
                 </div>
                 <div className="flex items-center">
@@ -497,7 +567,7 @@ export default function App() {
                       </h4>
                       {articles.length > 1 && (
                         <button
-                          onClick={() => setArticles(p => p.filter((_, idx) => idx !== index))}
+                          onClick={() => removeArticle(index)}
                           className="text-red-600 hover:text-red-800 text-sm"
                         >
                           Supprimer
@@ -509,11 +579,7 @@ export default function App() {
                       placeholder="Désignation *"
                       className="w-full p-3 border border-gray-300 rounded-lg"
                       value={article.designation}
-                      onChange={e => {
-                        const newArticles = [...articles];
-                        newArticles[index].designation = e.target.value;
-                        setArticles(newArticles);
-                      }}
+                      onChange={e => updateArticle(index, 'designation', e.target.value)}
                       required
                     />
 
@@ -525,11 +591,7 @@ export default function App() {
                           min="1"
                           className="w-full p-3 border border-gray-300 rounded-lg"
                           value={article.quantite}
-                          onChange={e => {
-                            const newArticles = [...articles];
-                            newArticles[index].quantite = e.target.value;
-                            setArticles(newArticles);
-                          }}
+                          onChange={e => updateArticle(index, 'quantite', e.target.value)}
                         />
                       </div>
                       <div>
@@ -537,36 +599,38 @@ export default function App() {
                           placeholder="Unité de mesure (kg, L, Pièces, etc.)"
                           className="w-full p-3 border border-gray-300 rounded-lg"
                           value={article.unite_mesure}
-                          onChange={e => {
-                            const newArticles = [...articles];
-                            newArticles[index].unite_mesure = e.target.value;
-                            setArticles(newArticles);
-                          }}
+                          onChange={e => updateArticle(index, 'unite_mesure', e.target.value)}
                         />
                       </div>
                     </div>
 
+                    {/* Photo Upload - Facultatif */}
                     <div className="space-y-2">
                       <label className="block text-sm font-medium text-gray-700">
-                        Photo (optionnel)
+                        Photo (facultatif)
                       </label>
                       <input
                         type="file"
                         accept="image/*"
                         className="w-full p-2 border border-gray-300 rounded-lg"
-                        onChange={e => {
-                          const newArticles = [...articles];
-                          newArticles[index].photo = e.target.files[0];
-                          setArticles(newArticles);
-                        }}
+                        onChange={e => updateArticle(index, 'photo', e.target.files[0])}
                       />
                       {article.photo && (
                         <div className="mt-2">
+                          <p className="text-sm text-gray-600 mb-2">Aperçu :</p>
                           <img
                             src={URL.createObjectURL(article.photo)}
                             alt="Preview"
                             className="h-32 w-auto object-cover rounded-lg border"
+                            onLoad={(e) => URL.revokeObjectURL(e.target.src)}
                           />
+                          <button
+                            type="button"
+                            onClick={() => updateArticle(index, 'photo', null)}
+                            className="mt-2 text-sm text-red-600 hover:text-red-800"
+                          >
+                            Supprimer la photo
+                          </button>
                         </div>
                       )}
                     </div>
@@ -576,7 +640,7 @@ export default function App() {
 
               <div className="flex flex-col sm:flex-row gap-3">
                 <button
-                  onClick={() => setArticles([...articles, { ...EMPTY_ARTICLE }])}
+                  onClick={addArticle}
                   className="px-6 py-3 border-2 border-indigo-600 text-indigo-600 rounded-lg hover:bg-indigo-50 transition-colors"
                 >
                   + Ajouter un autre article
@@ -619,7 +683,7 @@ export default function App() {
                             )}
                           </div>
                           <p className="text-sm text-gray-600">
-                            {new Date(request.date_demande).toLocaleDateString()}
+                            Date: {new Date(request.date_demande).toLocaleDateString()}
                           </p>
                           <p className="text-xs text-gray-500">
                             Statut : <span className="font-medium">{request.statut}</span>
@@ -629,6 +693,9 @@ export default function App() {
                           <p className="text-xs text-gray-500">
                             {request.articles?.length || 0} article(s)
                           </p>
+                          {request.articles?.some(a => a.photo_url) && (
+                            <p className="text-xs text-blue-600 mt-1">📷 Avec photo</p>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -676,7 +743,7 @@ export default function App() {
                             {request.departement_concerner}
                           </p>
                           <p className="text-sm text-gray-600">
-                            {new Date(request.date_demande).toLocaleDateString()}
+                            Date demande: {new Date(request.date_demande).toLocaleDateString()}
                           </p>
                         </div>
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${
@@ -712,13 +779,29 @@ export default function App() {
                         <div className="space-y-3">
                           {request.articles?.map((article, idx) => (
                             <div key={idx} className="bg-gray-50 rounded-lg p-3">
-                              <p className="font-medium text-gray-900">{article.designation}</p>
-                              <div className="flex justify-between text-sm text-gray-600 mt-2">
-                                <span>Quantité: {article.quantite || '1'}</span>
-                                {article.unite_mesure && (
-                                  <span>Unité: {article.unite_mesure}</span>
+                              <div className="flex justify-between items-start">
+                                <div>
+                                  <p className="font-medium text-gray-900">{article.designation}</p>
+                                  <div className="flex gap-4 text-sm text-gray-600 mt-2">
+                                    <span>Qté: {article.quantite || '1'}</span>
+                                    {article.unite_mesure && (
+                                      <span>Unité: {article.unite_mesure}</span>
+                                    )}
+                                  </div>
+                                </div>
+                                {article.photo_url && (
+                                  <span className="text-blue-600 text-xs">📷</span>
                                 )}
                               </div>
+                              {article.photo_url && (
+                                <div className="mt-2">
+                                  <img
+                                    src={article.photo_url}
+                                    alt={article.designation}
+                                    className="h-24 w-auto object-cover rounded border"
+                                  />
+                                </div>
+                              )}
                             </div>
                           ))}
                         </div>
