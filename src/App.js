@@ -1,12 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import {
-  ShoppingCart,
-  Package,
-  Bell,
-  LogIn,
-  LogOut,
-  CheckCircle
-} from 'lucide-react';
+import { ShoppingCart, Package, Bell, LogIn, LogOut, CheckCircle } from 'lucide-react';
 import { supabase } from './supabaseClient';
 import jsPDF from 'jspdf';
 
@@ -30,7 +23,6 @@ const EMPTY_ARTICLE = {
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
-
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
 
   const [requests, setRequests] = useState([]);
@@ -45,7 +37,22 @@ export default function App() {
   });
 
   const [devisFiles, setDevisFiles] = useState([]);
-  const [previewUrls, setPreviewUrls] = useState([]);
+
+  /* ================= HYDRATE USER ================= */
+  const hydrateUser = async (user) => {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role, nom')
+      .eq('id', user.id)
+      .single();
+
+    setCurrentUser({ ...user, ...profile });
+    setIsAuthenticated(true);
+
+    loadRequests(profile?.role, user.id);
+    loadNotifications(profile?.role);
+    subscribeRealtime(profile?.role, user.id);
+  };
 
   /* ================= INIT SESSION ================= */
   useEffect(() => {
@@ -66,22 +73,10 @@ export default function App() {
       }
     });
 
-    return () => listener?.subscription?.unsubscribe();
+    return () => {
+      listener?.subscription?.unsubscribe();
+    };
   }, []);
-
-  const hydrateUser = async (user) => {
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role, nom')
-      .eq('id', user.id)
-      .single();
-
-    setCurrentUser({ ...user, ...profile });
-    setIsAuthenticated(true);
-    loadRequests(profile?.role, user.id);
-    loadNotifications(profile?.role);
-    subscribeRealtime(profile?.role, user.id);
-  };
 
   /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
@@ -102,19 +97,28 @@ export default function App() {
 
   /* ================= REALTIME ================= */
   const subscribeRealtime = (role, userId) => {
-    supabase.removeAllChannels();
-
-    supabase.channel('rt-requests')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, p => {
-        const r = p.new;
+    const requestsChannel = supabase
+      .channel('rt-requests')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, payload => {
+        const r = payload.new;
         if (role === 'magasinier' && r.user_id !== userId) return;
         setRequests(prev => [r, ...prev.filter(x => x.id !== r.id)]);
-      }).subscribe();
+      })
+      .subscribe();
 
-    supabase.channel('rt-notifs')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, p => {
-        if (p.new.type === role) setNotifications(prev => [p.new, ...prev]);
-      }).subscribe();
+    const notifChannel = supabase
+      .channel('rt-notifs')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, payload => {
+        if (payload.new.type === role) {
+          setNotifications(prev => [payload.new, ...prev]);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(requestsChannel);
+      supabase.removeChannel(notifChannel);
+    };
   };
 
   /* ================= AUTH ================= */
@@ -133,30 +137,25 @@ export default function App() {
   };
 
   /* ================= NOTIFS ================= */
-  const unreadCount = useMemo(() => notifications.filter(n => !n.read).length, [notifications]);
+  const unreadCount = useMemo(
+    () => notifications.filter(n => !n.read).length,
+    [notifications]
+  );
 
   const markNotificationAsRead = async (id) => {
     await supabase.from('notifications').update({ read: true }).eq('id', id);
-    setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n));
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
   };
 
   /* ================= ARTICLES ================= */
-  const addArticle = () => setArticles(p => [...p, { ...EMPTY_ARTICLE }]);
+  const addArticle = () => setArticles(prev => [...prev, { ...EMPTY_ARTICLE }]);
   const updateArticle = (i, f, v) =>
-    setArticles(p => { const c = [...p]; c[i][f] = v; return c; });
-  const removeArticle = (i) => setArticles(p => p.filter((_, idx) => idx !== i));
-
-  /* ================= UPLOAD DEVIS ================= */
-  const uploadDevisFiles = async (requestId) => {
-    const uploaded = [];
-    for (const file of devisFiles) {
-      const ext = file.name.split('.').pop();
-      const path = `${currentUser.id}/${requestId}_${Date.now()}.${ext}`;
-      const { error } = await supabase.storage.from('devis').upload(path, file);
-      if (!error) uploaded.push({ name: file.name, path, type: file.type });
-    }
-    return uploaded;
-  };
+    setArticles(prev => {
+      const copy = [...prev];
+      copy[i][f] = v;
+      return copy;
+    });
+  const removeArticle = (i) => setArticles(prev => prev.filter((_, idx) => idx !== i));
 
   /* ================= SUBMIT REQUEST ================= */
   const handleSubmitRequest = async () => {
@@ -164,37 +163,33 @@ export default function App() {
     if (!valid.length) return alert('Articles incomplets');
 
     const totalGeneral = valid.reduce(
-      (s, a) => s + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1), 0
+      (s, a) => s + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1),
+      0
     );
 
-    const { data: request } = await supabase.from('requests').insert([{
-      ...formData,
-      user_id: currentUser.id,
-      articles: valid,
-      totalGeneral,
-      statut: 'En attente',
-      dateCreation: new Date().toISOString()
-    }]).select().single();
-
-    let devisInfo = '';
-    if (devisFiles.length) {
-      const uploaded = await uploadDevisFiles(request.id);
-      await supabase.from('requests').update({ devis_urls: uploaded }).eq('id', request.id);
-      devisInfo = '\n📎 Devis joint';
-    }
+    const { data: request } = await supabase
+      .from('requests')
+      .insert([{
+        ...formData,
+        user_id: currentUser.id,
+        articles: valid,
+        totalGeneral,
+        statut: 'En attente',
+        dateCreation: new Date().toISOString()
+      }])
+      .select()
+      .single();
 
     fetch(`https://api.telegram.org/bot${TELEGRAM_CONFIG.acheteurBotToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: TELEGRAM_CONFIG.acheteurChatId,
-        text: `🛒 Nouvelle demande d'achat\n👤 ${formData.nomDemandeur}\n💰 ${totalGeneral.toFixed(2)} MAD${devisInfo}`
+        text: `🛒 Nouvelle demande d'achat\n👤 ${formData.nomDemandeur}\n💰 ${totalGeneral.toFixed(2)} MAD`
       })
     });
 
     setArticles([{ ...EMPTY_ARTICLE }]);
-    setDevisFiles([]);
-    setPreviewUrls([]);
   };
 
   /* ================= EXPORT PDF ================= */
@@ -219,20 +214,12 @@ export default function App() {
           className="bg-white w-full max-w-sm rounded-xl p-6 space-y-4"
         >
           <h1 className="text-2xl font-bold text-center">Connexion</h1>
-          <input
-            type="email"
-            required
-            placeholder="Email"
+          <input type="email" required placeholder="Email"
             className="w-full p-3 border rounded-lg"
-            onChange={e => setLoginForm({ ...loginForm, username: e.target.value })}
-          />
-          <input
-            type="password"
-            required
-            placeholder="Mot de passe"
+            onChange={e => setLoginForm({ ...loginForm, username: e.target.value })} />
+          <input type="password" required placeholder="Mot de passe"
             className="w-full p-3 border rounded-lg"
-            onChange={e => setLoginForm({ ...loginForm, password: e.target.value })}
-          />
+            onChange={e => setLoginForm({ ...loginForm, password: e.target.value })} />
           <button className="w-full bg-indigo-600 text-white py-3 rounded-lg flex justify-center gap-2">
             <LogIn /> Connexion
           </button>
@@ -261,11 +248,9 @@ export default function App() {
       {showNotifications && (
         <div className="p-4">
           {notifications.map(n => (
-            <div
-              key={n.id}
+            <div key={n.id}
               onClick={() => markNotificationAsRead(n.id)}
-              className={`p-3 rounded ${n.read ? 'bg-white' : 'bg-indigo-100'}`}
-            >
+              className={`p-3 rounded ${n.read ? 'bg-white' : 'bg-indigo-100'}`}>
               {n.message}
             </div>
           ))}
@@ -280,23 +265,9 @@ export default function App() {
 
             <button
               onClick={() => exportPDF(r)}
-              className="text-sm text-indigo-600 underline mt-2"
-            >
+              className="text-sm text-indigo-600 underline mt-2">
               📄 Export PDF
             </button>
-
-            {r.devis_urls?.map((d, i) => (
-              <button
-                key={i}
-                onClick={async () => {
-                  const { data } = await supabase.storage.from('devis').createSignedUrl(d.path, 60);
-                  window.open(data.signedUrl, '_blank');
-                }}
-                className="block text-xs text-indigo-600 underline mt-1"
-              >
-                📎 {d.name}
-              </button>
-            )}
 
             {r.delaiLivraisonFournisseur && (
               <div className="mt-2 flex items-center gap-2 text-green-600">
