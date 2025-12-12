@@ -56,7 +56,7 @@ export default function PurchaseRequestSystem() {
   });
 
   /* ============================================================
-     INIT SESSION + DATA
+     INIT SESSION + PROFIL
   ============================================================ */
   useEffect(() => {
     const init = async () => {
@@ -65,7 +65,6 @@ export default function PurchaseRequestSystem() {
 
       if (session?.user) {
         setIsAuthenticated(true);
-        setCurrentUser(session.user);
 
         const { data: profile } = await supabase
           .from('profiles')
@@ -73,12 +72,11 @@ export default function PurchaseRequestSystem() {
           .eq('id', session.user.id)
           .single();
 
-        if (profile) {
-          setCurrentUser((u) => ({ ...u, ...profile }));
-        }
+        setCurrentUser({ ...session.user, ...profile });
 
-        loadRequests(profile?.role, session.user.id);
-        loadNotifications(profile?.role);
+        await loadRequests(profile?.role, session.user.id);
+        await loadNotifications(profile?.role);
+        subscribeRealtime(profile?.role, session.user.id);
       }
     };
 
@@ -86,28 +84,46 @@ export default function PurchaseRequestSystem() {
 
     const { data: listener } = supabase.auth.onAuthStateChange(
       async (_event, session) => {
-        if (session?.user) {
-          setIsAuthenticated(true);
-          setCurrentUser(session.user);
-        } else {
+        if (!session?.user) {
           setIsAuthenticated(false);
           setCurrentUser(null);
+          setRequests([]);
+          return;
         }
+
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('role, nom')
+          .eq('id', session.user.id)
+          .single();
+
+        setIsAuthenticated(true);
+        setCurrentUser({ ...session.user, ...profile });
+
+        await loadRequests(profile?.role, session.user.id);
+        await loadNotifications(profile?.role);
+        subscribeRealtime(profile?.role, session.user.id);
       }
     );
 
-    return () => listener.subscription.unsubscribe();
+    return () => {
+      listener?.subscription?.unsubscribe();
+      supabase.removeAllChannels();
+    };
   }, []);
 
   /* ============================================================
-     LOADERS
+     LOADERS (SUPABASE = SOURCE DE VÉRITÉ)
   ============================================================ */
   const loadRequests = async (role, userId) => {
-    let query = supabase.from('requests').select('*').order('dateCreation', {
-      ascending: false
-    });
+    let query = supabase
+      .from('requests')
+      .select('*')
+      .order('dateCreation', { ascending: false });
 
-    if (role === 'magasinier') query = query.eq('user_id', userId);
+    if (role === 'magasinier') {
+      query = query.eq('user_id', userId);
+    }
 
     const { data } = await query;
     setRequests(data || []);
@@ -121,6 +137,44 @@ export default function PurchaseRequestSystem() {
       .order('id', { ascending: false });
 
     setNotifications(data || []);
+  };
+
+  /* ============================================================
+     REALTIME SUPABASE
+  ============================================================ */
+  const subscribeRealtime = (role, userId) => {
+    supabase.removeAllChannels();
+
+    supabase
+      .channel('realtime-requests')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'requests' },
+        (payload) => {
+          const newRow = payload.new;
+
+          if (role === 'magasinier' && newRow.user_id !== userId) return;
+
+          setRequests((prev) => {
+            const filtered = prev.filter((r) => r.id !== newRow.id);
+            return [newRow, ...filtered];
+          });
+        }
+      )
+      .subscribe();
+
+    supabase
+      .channel('realtime-notifications')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'notifications' },
+        (payload) => {
+          if (payload.new.type === role) {
+            setNotifications((prev) => [payload.new, ...prev]);
+          }
+        }
+      )
+      .subscribe();
   };
 
   /* ============================================================
@@ -165,6 +219,7 @@ export default function PurchaseRequestSystem() {
     await supabase.auth.signOut();
     setIsAuthenticated(false);
     setCurrentUser(null);
+    setRequests([]);
   };
 
   /* ============================================================
@@ -183,27 +238,21 @@ export default function PurchaseRequestSystem() {
   };
 
   const addNotification = async (message, type) => {
-    const { data } = await supabase
-      .from('notifications')
-      .insert([{ message, type, read: false }])
-      .select()
-      .single();
-
-    if (data) setNotifications((prev) => [data, ...prev]);
+    await supabase.from('notifications').insert([
+      { message, type, read: false }
+    ]);
   };
 
   /* ============================================================
      ARTICLES
   ============================================================ */
   const addArticle = () => setArticles((p) => [...p, { ...EMPTY_ARTICLE }]);
-
   const updateArticle = (i, f, v) =>
     setArticles((p) => {
       const c = [...p];
       c[i][f] = v;
       return c;
     });
-
   const removeArticle = (i) =>
     setArticles((p) => p.filter((_, idx) => idx !== i));
 
@@ -211,9 +260,6 @@ export default function PurchaseRequestSystem() {
      SUBMIT REQUEST
   ============================================================ */
   const handleSubmitRequest = async () => {
-    if (!formData.nomDemandeur || !formData.dateLivraisonSouhaitee)
-      return alert('Champs obligatoires manquants');
-
     const validArticles = articles.filter(
       (a) => a.designation && a.quantite && a.dimensions && a.prix
     );
@@ -231,10 +277,10 @@ export default function PurchaseRequestSystem() {
       .insert([
         {
           ...formData,
+          user_id: currentUser.id,
           articles: validArticles,
           totalGeneral,
           statut: 'En attente',
-          user_id: currentUser.id,
           dateCreation: new Date().toISOString()
         }
       ])
@@ -323,7 +369,6 @@ export default function PurchaseRequestSystem() {
   return (
     <div className="min-h-screen bg-slate-100 p-6">
       <div className="max-w-7xl mx-auto">
-        {/* HEADER */}
         <div className="bg-white p-6 rounded-xl shadow mb-6 flex justify-between">
           <div>
             <h1 className="text-2xl font-bold">Gestion des Achats</h1>
@@ -351,7 +396,6 @@ export default function PurchaseRequestSystem() {
           </div>
         </div>
 
-        {/* NOTIFICATIONS */}
         {showNotifications && (
           <div className="bg-white rounded-xl shadow mb-6">
             {notifications.map((n) => (
@@ -368,20 +412,6 @@ export default function PurchaseRequestSystem() {
           </div>
         )}
 
-        {/* MAGASINIER */}
-        {currentUser?.role === 'magasinier' && (
-          <div className="bg-white p-6 rounded-xl shadow">
-            <h2 className="text-xl font-bold mb-4">Nouvelle demande</h2>
-            <button
-              onClick={handleSubmitRequest}
-              className="bg-indigo-600 text-white px-6 py-2 rounded-lg"
-            >
-              Envoyer la demande
-            </button>
-          </div>
-        )}
-
-        {/* ACHETEUR */}
         {currentUser?.role === 'acheteur' &&
           requests.map((r) => {
             const totalPrix = (r.articles || []).reduce(
@@ -398,7 +428,7 @@ export default function PurchaseRequestSystem() {
                 className="bg-white p-6 rounded-xl shadow mb-4"
               >
                 <p className="font-bold">{r.nomDemandeur}</p>
-                <p>Total : {totalPrix.toFixed(2)} MAD</p>
+                <p>💰 {totalPrix.toFixed(2)} MAD</p>
 
                 {!r.delaiLivraisonFournisseur && (
                   <button
