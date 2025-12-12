@@ -35,20 +35,29 @@ export default function App() {
     dateLivraisonSouhaitee: ''
   });
 
-  /* ================= HYDRATE USER ================= */
+  /* ================= SAFE HYDRATE USER ================= */
   const hydrateUser = async (user) => {
+    let role = 'magasinier';
+    let nom = user.email;
+
     const { data: profile } = await supabase
       .from('profiles')
       .select('role, nom')
       .eq('id', user.id)
-      .single();
+      .maybeSingle();
 
-    setCurrentUser({ ...user, ...profile });
+    if (profile) {
+      role = profile.role || role;
+      nom = profile.nom || nom;
+    }
+
+    const safeUser = { ...user, role, nom };
+    setCurrentUser(safeUser);
     setIsAuthenticated(true);
 
-    loadRequests(profile?.role, user.id);
-    loadNotifications(profile?.role);
-    subscribeRealtime(profile?.role, user.id);
+    await loadRequests(role, user.id);
+    await loadNotifications(role);
+    subscribeRealtime(role, user.id);
   };
 
   /* ================= INIT SESSION ================= */
@@ -57,7 +66,6 @@ export default function App() {
       const { data } = await supabase.auth.getSession();
       if (data?.session?.user) hydrateUser(data.session.user);
     };
-
     init();
 
     const { data: listener } = supabase.auth.onAuthStateChange((_e, session) => {
@@ -92,28 +100,11 @@ export default function App() {
 
   /* ================= REALTIME ================= */
   const subscribeRealtime = (role, userId) => {
-    const reqChannel = supabase
-      .channel('rt-requests')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, payload => {
-        const r = payload.new;
-        if (role === 'magasinier' && r.user_id !== userId) return;
-        setRequests(prev => [r, ...prev.filter(x => x.id !== r.id)]);
-      })
-      .subscribe();
-
-    const notifChannel = supabase
-      .channel('rt-notifs')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, payload => {
-        if (payload.new.type === role) {
-          setNotifications(prev => [payload.new, ...prev]);
-        }
-      })
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(reqChannel);
-      supabase.removeChannel(notifChannel);
-    };
+    supabase.channel('rt-requests')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, p => {
+        if (role === 'magasinier' && p.new.user_id !== userId) return;
+        setRequests(prev => [p.new, ...prev.filter(x => x.id !== p.new.id)]);
+      }).subscribe();
   };
 
   /* ================= AUTH ================= */
@@ -132,49 +123,20 @@ export default function App() {
   };
 
   /* ================= NOTIFS ================= */
-  const unreadCount = useMemo(
-    () => notifications.filter(n => !n.read).length,
-    [notifications]
-  );
+  const unreadCount = useMemo(() => notifications.filter(n => !n.read).length, [notifications]);
 
   const markNotificationAsRead = async (id) => {
     await supabase.from('notifications').update({ read: true }).eq('id', id);
-    setNotifications(prev =>
-      prev.map(n => (n.id === id ? { ...n, read: true } : n))
-    );
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
   };
-
-  /* ================= ARTICLES ================= */
-  const addArticle = () =>
-    setArticles(prev => [...prev, { ...EMPTY_ARTICLE }]);
-
-  const updateArticle = (i, field, value) => {
-    setArticles(prev => {
-      const copy = [...prev];
-      copy[i][field] = value;
-      return copy;
-    });
-  };
-
-  const removeArticle = (i) =>
-    setArticles(prev => prev.filter((_, idx) => idx !== i));
 
   /* ================= SUBMIT REQUEST ================= */
   const handleSubmitRequest = async () => {
-    const valid = articles.filter(
-      a => a.designation && a.quantite && a.dimensions && a.prix
-    );
-
-    if (!valid.length) {
-      alert('Veuillez saisir au moins un article complet');
-      return;
-    }
+    const valid = articles.filter(a => a.designation && a.quantite && a.dimensions && a.prix);
+    if (!valid.length) return alert('Articles incomplets');
 
     const totalGeneral = valid.reduce(
-      (s, a) =>
-        s +
-        (parseFloat(a.prix) || 0) *
-          (parseFloat(a.quantite) || 1),
+      (s, a) => s + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1),
       0
     );
 
@@ -204,10 +166,7 @@ export default function App() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-indigo-700 p-4">
         <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleLogin();
-          }}
+          onSubmit={(e) => { e.preventDefault(); handleLogin(); }}
           className="bg-white w-full max-w-sm rounded-xl p-6 space-y-4"
         >
           <h1 className="text-2xl font-bold text-center">Connexion</h1>
@@ -217,9 +176,7 @@ export default function App() {
             required
             placeholder="Email"
             className="w-full p-3 border rounded-lg"
-            onChange={(e) =>
-              setLoginForm({ ...loginForm, username: e.target.value })
-            }
+            onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })}
           />
 
           <input
@@ -227,9 +184,7 @@ export default function App() {
             required
             placeholder="Mot de passe"
             className="w-full p-3 border rounded-lg"
-            onChange={(e) =>
-              setLoginForm({ ...loginForm, password: e.target.value })
-            }
+            onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
           />
 
           <button className="w-full bg-indigo-600 text-white py-3 rounded-lg flex justify-center gap-2">
@@ -242,8 +197,8 @@ export default function App() {
 
   /* ================= MAIN UI ================= */
   return (
-    <div className="min-h-screen bg-slate-100 pb-20">
-      <div className="sticky top-0 bg-white shadow p-4 flex justify-between">
+    <div className="min-h-screen bg-slate-100">
+      <div className="bg-white shadow p-4 flex justify-between">
         <div>
           <p className="font-bold">{currentUser?.nom}</p>
           <p className="text-xs">{currentUser?.role}</p>
@@ -252,13 +207,9 @@ export default function App() {
         <div className="flex gap-3">
           <button onClick={() => setShowNotifications(!showNotifications)}>
             <Bell />
-            {unreadCount > 0 && (
-              <span className="text-red-500">{unreadCount}</span>
-            )}
+            {unreadCount > 0 && <span className="text-red-500">{unreadCount}</span>}
           </button>
-          <button onClick={handleLogout}>
-            <LogOut />
-          </button>
+          <button onClick={handleLogout}><LogOut /></button>
         </div>
       </div>
 
@@ -278,16 +229,13 @@ export default function App() {
 
       <div className="p-4 space-y-4">
         {requests.map(r => (
-          <div key={r.id} className="bg-white p-4 rounded-xl shadow">
+          <div key={r.id} className="bg-white p-4 rounded shadow">
             <p className="font-bold">{r.nomDemandeur}</p>
-            <p className="text-sm">
-              💰 {r.totalGeneral?.toFixed(2)} MAD
-            </p>
+            <p>💰 {r.totalGeneral?.toFixed(2)} MAD</p>
 
             {r.delaiLivraisonFournisseur && (
-              <div className="mt-2 flex items-center gap-2 text-green-600">
-                <CheckCircle />
-                {r.delaiLivraisonFournisseur}
+              <div className="text-green-600 flex items-center gap-2 mt-2">
+                <CheckCircle /> {r.delaiLivraisonFournisseur}
               </div>
             )}
           </div>
