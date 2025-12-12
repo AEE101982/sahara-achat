@@ -83,11 +83,24 @@ export default function App() {
 
   /* ================= LOADERS ================= */
   const loadRequests = async (role, userId) => {
-    let q = supabase.from('requests').select('*').order('dateCreation', { ascending: false });
-    if (role === 'magasinier') q = q.eq('user_id', userId);
-    const { data } = await q;
-    setRequests(data || []);
-  };
+  let query = supabase
+    .from('requests')
+    .select('*')
+    .order('dateCreation', { ascending: false });
+
+  if (role === 'magasinier') {
+    query = query.eq('user_id', userId);
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    console.error('Erreur loadRequests:', error);
+    return;
+  }
+
+  setRequests(data || []);
+};
 
   const loadNotifications = async (role) => {
     const { data } = await supabase
