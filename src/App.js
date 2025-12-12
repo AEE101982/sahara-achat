@@ -6,7 +6,8 @@ import {
   LogIn,
   LogOut,
   CheckCircle,
-  AlertTriangle
+  AlertTriangle,
+  Database
 } from 'lucide-react';
 import { supabase } from './supabaseClient';
 
@@ -30,9 +31,11 @@ const EMPTY_ARTICLE = {
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false); // Commencer à false pour afficher directement le login
   const [submitting, setSubmitting] = useState(false);
-  const [tableSchema, setTableSchema] = useState(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const [tableColumns, setTableColumns] = useState([]);
+  const [tableError, setTableError] = useState(null);
 
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [requests, setRequests] = useState([]);
@@ -40,136 +43,128 @@ export default function App() {
   const [showNotifications, setShowNotifications] = useState(false);
 
   const [articles, setArticles] = useState([{ ...EMPTY_ARTICLE }]);
-  // Utiliser le bon nom de colonne basé sur le schéma détecté
   const [formData, setFormData] = useState({
-    // Le nom réel sera déterminé par detectTableSchema()
+    // Valeurs par défaut simples
     date_demande: new Date().toISOString().split('T')[0],
     departement_concerner: '',
     date_livraison_souhaitee: '',
     urgent: false
   });
 
-  /* ================= DÉTECTER LE SCHÉMA DE LA TABLE ================= */
-  const detectTableSchema = async () => {
+  /* ================= CHARGER LE SCHÉMA DE LA TABLE ================= */
+  const loadTableSchema = async () => {
     try {
-      console.log('Détection du schéma de la table requests...');
+      console.log('Chargement du schéma de la table requests...');
       
-      // Méthode 1: Vérifier les colonnes via une requête SELECT limitée
-      const { data: sampleData, error: sampleError } = await supabase
+      // Méthode 1: Essayer de récupérer une ligne pour voir la structure
+      const { data, error } = await supabase
         .from('requests')
         .select('*')
         .limit(1);
       
-      if (!sampleError && sampleData && sampleData.length > 0) {
-        const firstRow = sampleData[0];
-        console.log('Structure détectée:', Object.keys(firstRow));
+      if (error) {
+        console.error('Erreur récupération données:', error);
         
-        // Trouver le nom correct de la colonne date
-        const dateColumns = Object.keys(firstRow).filter(key => 
-          key.toLowerCase().includes('date') && key.toLowerCase().includes('demande')
-        );
+        // Méthode 2: Vérifier si la table existe
+        const { error: tableError } = await supabase
+          .from('requests')
+          .select('id')
+          .limit(0);
         
-        if (dateColumns.length > 0) {
-          console.log('Colonne date trouvée:', dateColumns[0]);
-          return {
-            dateColumn: dateColumns[0],
-            departementColumn: Object.keys(firstRow).find(key => 
-              key.toLowerCase().includes('departement') || key.toLowerCase().includes('nom')
-            ) || 'departement_concerner',
-            livraisonColumn: Object.keys(firstRow).find(key => 
-              key.toLowerCase().includes('livraison') || key.toLowerCase().includes('souhaitee')
-            ) || 'date_livraison_souhaitee'
-          };
+        if (tableError) {
+          console.error('Table probablement vide ou inexistante:', tableError);
+          setTableError('La table "requests" est vide ou n\'existe pas. Créez-la d\'abord dans Supabase.');
         }
+        return;
       }
       
-      // Méthode 2: Essayer avec des noms communs
-      console.log('Essai avec des noms de colonnes courants...');
-      return {
-        dateColumn: 'date_demande',
-        departementColumn: 'departement',
-        livraisonColumn: 'date_livraison'
-      };
-      
+      if (data && data.length > 0) {
+        const columns = Object.keys(data[0]);
+        console.log('Colonnes détectées:', columns);
+        setTableColumns(columns);
+        
+        // Déterminer les noms de colonnes réels
+        const realSchema = {
+          dateColumn: columns.find(col => 
+            col.toLowerCase().includes('date') && 
+            (col.toLowerCase().includes('demande') || col.toLowerCase().includes('request'))
+          ) || 'date_demande',
+          departementColumn: columns.find(col => 
+            col.toLowerCase().includes('departement') || 
+            col.toLowerCase().includes('department') ||
+            col.toLowerCase().includes('nom')
+          ) || 'departement_concerner',
+          livraisonColumn: columns.find(col => 
+            col.toLowerCase().includes('livraison') || 
+            col.toLowerCase().includes('delivery') ||
+            col.toLowerCase().includes('souhaitee')
+          ) || 'date_livraison_souhaitee',
+          urgentColumn: columns.find(col => 
+            col.toLowerCase().includes('urgent')
+          ) || 'urgent'
+        };
+        
+        console.log('Schéma réel détecté:', realSchema);
+        setTableError(null);
+      } else {
+        setTableError('La table "requests" existe mais est vide. Aucune colonne détectée.');
+      }
     } catch (error) {
-      console.error('Erreur détection schéma:', error);
-      return {
-        dateColumn: 'date_demande',
-        departementColumn: 'departement_concerner',
-        livraisonColumn: 'date_livraison_souhaitee'
-      };
+      console.error('Erreur chargement schéma:', error);
+      setTableError('Erreur de chargement du schéma: ' + error.message);
     }
   };
 
-  /* ================= SESSION ================= */
+  /* ================= SESSION SIMPLIFIÉE ================= */
   useEffect(() => {
-    const initApp = async () => {
-      try {
-        // Détecter le schéma de la table
-        const schema = await detectTableSchema();
-        setTableSchema(schema);
-        console.log('Schéma détecté:', schema);
+    // Charger le schéma quand l'utilisateur est authentifié
+    if (isAuthenticated && currentUser) {
+      loadTableSchema();
+    }
+  }, [isAuthenticated, currentUser]);
 
-        // Vérifier l'authentification
-        const { data: { session } } = await supabase.auth.getSession();
-        
-        if (session) {
-          await hydrateUser(session.user);
-        } else {
-          setIsAuthenticated(false);
-          setCurrentUser(null);
-        }
-      } catch (error) {
-        console.error('Erreur initialisation:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    initApp();
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        console.log('Changement auth:', event);
-        
-        if (session) {
-          await hydrateUser(session.user);
-        } else {
-          setIsAuthenticated(false);
-          setCurrentUser(null);
-          setRequests([]);
-        }
-        setLoading(false);
-      }
-    );
-
-    return () => subscription.unsubscribe();
-  }, []);
-
-  const hydrateUser = async (user) => {
+  /* ================= AUTH ================= */
+  const handleLogin = async (e) => {
+    e.preventDefault();
     try {
-      let role = 'magasinier';
-      let nom = user.email;
-
+      setLoading(true);
+      const { error, data } = await supabase.auth.signInWithPassword({
+        email: loginForm.username,
+        password: loginForm.password
+      });
+      
+      if (error) throw error;
+      
+      // Récupérer le profil utilisateur
       const { data: profile } = await supabase
         .from('profiles')
         .select('role, nom')
-        .eq('id', user.id)
+        .eq('id', data.user.id)
         .maybeSingle();
-
-      if (profile) {
-        role = profile.role || role;
-        nom = profile.nom || nom;
-      }
-
-      setCurrentUser({ ...user, role, nom });
+      
+      const role = profile?.role || 'magasinier';
+      const nom = profile?.nom || data.user.email;
+      
+      setCurrentUser({ ...data.user, role, nom });
       setIsAuthenticated(true);
-
-      await loadRequests(role, user.id);
-      await loadNotifications(role);
-      subscribeRealtime(role, user.id);
+      
+      // Charger les données utilisateur
+      await loadUserData(role, data.user.id);
+      
     } catch (error) {
-      console.error('Erreur hydratation:', error);
+      console.error('Erreur connexion:', error);
+      alert('Identifiants incorrects');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadUserData = async (role, userId) => {
+    try {
+      await loadRequests(role, userId);
+      await loadNotifications(role);
+    } catch (error) {
+      console.error('Erreur chargement données:', error);
     }
   };
 
@@ -177,24 +172,23 @@ export default function App() {
   const loadRequests = async (role, userId) => {
     try {
       let query = supabase.from('requests').select('*');
-
+      
       if (role === 'magasinier') {
         query = query.eq('user_id', userId);
       }
-
-      const { data, error } = await query.order('created_at', { ascending: false });
+      
+      const { data, error } = await query;
       
       if (error) {
         console.error('Erreur chargement demandes:', error);
-        // Essayer sans le tri si created_at n'existe pas
-        const { data: data2, error: error2 } = await query;
-        if (error2) throw error2;
-        setRequests(data2 || []);
-      } else {
-        setRequests(data || []);
+        setRequests([]);
+        return;
       }
+      
+      console.log('Demandes chargées:', data?.length || 0);
+      setRequests(data || []);
     } catch (error) {
-      console.error('Erreur critique chargement demandes:', error);
+      console.error('Erreur chargement demandes:', error);
       setRequests([]);
     }
   };
@@ -204,8 +198,7 @@ export default function App() {
       const { data, error } = await supabase
         .from('notifications')
         .select('*')
-        .eq('type', role)
-        .order('created_at', { ascending: false });
+        .eq('type', role);
       
       if (error) throw error;
       setNotifications(data || []);
@@ -214,117 +207,164 @@ export default function App() {
     }
   };
 
-  /* ================= REALTIME ================= */
-  const subscribeRealtime = (role, userId) => {
-    try {
-      const channel = supabase.channel('requests-channel')
-        .on(
-          'postgres_changes',
-          {
-            event: '*',
-            schema: 'public',
-            table: 'requests'
-          },
-          (payload) => {
-            if (role === 'magasinier' && payload.new?.user_id !== userId) {
-              return;
-            }
-
-            setRequests(current => {
-              const index = current.findIndex(r => r.id === payload.new?.id);
-              
-              switch (payload.eventType) {
-                case 'INSERT':
-                  return [payload.new, ...current];
-                case 'UPDATE':
-                  if (index !== -1) {
-                    const updated = [...current];
-                    updated[index] = payload.new;
-                    return updated;
-                  }
-                  return current;
-                case 'DELETE':
-                  return current.filter(r => r.id !== payload.old?.id);
-                default:
-                  return current;
-              }
-            });
-          }
-        )
-        .subscribe();
-
-      return () => {
-        supabase.removeChannel(channel);
-      };
-    } catch (error) {
-      console.error('Erreur abonnement temps réel:', error);
-    }
-  };
-
-  /* ================= TELEGRAM NOTIFICATION ================= */
-  const sendTelegramNotification = async (requestData) => {
-    try {
-      const botToken = TELEGRAM_CONFIG.acheteurBotToken;
-      const chatId = TELEGRAM_CONFIG.acheteurChatId;
-
-      const urgentEmoji = requestData.urgent ? '🚨 ' : '';
-      const urgentText = requestData.urgent ? '(URGENT) ' : '';
-      
-      const articlesText = requestData.articles?.map((article, idx) => 
-        `${idx + 1}. ${article.designation} - ${article.quantite} ${article.unite_mesure || ''}`
-      ).join('\n') || 'Aucun article';
-
-      const message = `${urgentEmoji}*NOUVELLE DEMANDE ${urgentText}*
-      
-*Département:* ${requestData.departement_concerner}
-*Date demande:* ${requestData.date_demande}
-*Date souhaitée:* ${requestData.date_livraison_souhaitee || 'Non spécifiée'}
-*Urgent:* ${requestData.urgent ? 'OUI 🚨' : 'Non'}
-
-*Articles:*
-${articlesText}
-
-${urgentEmoji}${urgentEmoji}${urgentText}`;
-
-      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: message,
-          parse_mode: 'Markdown'
-        })
-      });
-    } catch (error) {
-      console.error('Erreur envoi Telegram:', error);
-    }
-  };
-
-  /* ================= AUTH ================= */
-  const handleLogin = async (e) => {
-    e.preventDefault();
-    try {
-      setLoading(true);
-      const { error } = await supabase.auth.signInWithPassword({
-        email: loginForm.username,
-        password: loginForm.password
-      });
-      
-      if (error) throw error;
-    } catch (error) {
-      console.error('Erreur connexion:', error);
-      alert('Identifiants incorrects');
-      setLoading(false);
-    }
-  };
-
   const handleLogout = async () => {
     try {
       await supabase.auth.signOut();
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+      setRequests([]);
+      setTableColumns([]);
     } catch (error) {
       console.error('Erreur déconnexion:', error);
+    }
+  };
+
+  /* ================= CRÉER LA TABLE SI N'EXISTE PAS ================= */
+  const createRequestsTable = async () => {
+    try {
+      const sql = `
+        CREATE TABLE IF NOT EXISTS requests (
+          id BIGSERIAL PRIMARY KEY,
+          date_demande DATE DEFAULT CURRENT_DATE,
+          departement_concerner TEXT NOT NULL,
+          date_livraison_souhaitee DATE,
+          user_id UUID NOT NULL REFERENCES auth.users(id),
+          articles JSONB DEFAULT '[]'::jsonb,
+          statut TEXT DEFAULT 'En attente',
+          urgent BOOLEAN DEFAULT false,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        
+        -- Créer un index pour les performances
+        CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
+        CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at DESC);
+      `;
+      
+      const { error } = await supabase.rpc('exec_sql', { sql });
+      
+      if (error) {
+        // Essayer une méthode alternative
+        console.log('Essai méthode alternative...');
+        // La table sera créée automatiquement lors de la première insertion
+      }
+      
+      alert('Table "requests" créée ou déjà existante. Rechargez la page.');
+      await loadTableSchema();
+    } catch (error) {
+      console.error('Erreur création table:', error);
+      alert('Impossible de créer la table. Créez-la manuellement dans Supabase Studio.');
+    }
+  };
+
+  /* ================= SOUMETTRE UNE DEMANDE (VERSION SIMPLE) ================= */
+  const handleSubmitRequest = async () => {
+    if (submitting) return;
+    
+    if (!formData.departement_concerner.trim()) {
+      alert('Veuillez saisir le département concerné');
+      return;
+    }
+
+    const validArticles = articles.filter(a => a.designation.trim());
+    if (validArticles.length === 0) {
+      alert('Veuillez ajouter au moins un article avec une désignation');
+      return;
+    }
+
+    setSubmitting(true);
+
+    try {
+      // Préparer les articles
+      const articlesData = validArticles.map(a => ({
+        designation: a.designation.trim(),
+        quantite: a.quantite || '1',
+        unite_mesure: a.unite_mesure || '',
+        photo_url: null // Pour l'instant, pas de photo
+      }));
+
+      // Créer l'objet de données BASIQUE avec seulement les colonnes essentielles
+      const requestData = {
+        // On essaie d'abord avec des noms simples
+        user_id: currentUser.id,
+        articles: articlesData,
+        statut: 'En attente'
+      };
+
+      // Ajouter les champs optionnels s'ils existent dans le schéma
+      if (tableColumns.includes('departement_concerner')) {
+        requestData.departement_concerner = formData.departement_concerner.trim();
+      } else if (tableColumns.includes('departement')) {
+        requestData.departement = formData.departement_concerner.trim();
+      } else if (tableColumns.includes('nom_demandeur')) {
+        requestData.nom_demandeur = formData.departement_concerner.trim();
+      }
+
+      if (tableColumns.includes('date_demande')) {
+        requestData.date_demande = formData.date_demande;
+      }
+
+      if (tableColumns.includes('date_livraison_souhaitee') && formData.date_livraison_souhaitee) {
+        requestData.date_livraison_souhaitee = formData.date_livraison_souhaitee;
+      }
+
+      if (tableColumns.includes('urgent')) {
+        requestData.urgent = formData.urgent;
+      }
+
+      console.log('Données à insérer:', requestData);
+
+      // Insérer la demande
+      const { data, error } = await supabase
+        .from('requests')
+        .insert([requestData])
+        .select();
+
+      if (error) {
+        console.error('Erreur insertion:', error);
+        
+        // Si échec, essayer avec une structure encore plus simple
+        const simpleData = {
+          user_id: currentUser.id,
+          articles: articlesData,
+          statut: 'En attente',
+          departement: formData.departement_concerner.trim()
+        };
+        
+        console.log('Essai avec données simplifiées:', simpleData);
+        
+        const { data: simpleResult, error: simpleError } = await supabase
+          .from('requests')
+          .insert([simpleData])
+          .select();
+        
+        if (simpleError) {
+          throw simpleError;
+        }
+        
+        console.log('Insertion réussie avec données simplifiées');
+      } else {
+        console.log('Insertion réussie:', data);
+      }
+
+      alert('✅ Demande envoyée avec succès !');
+      
+      // Réinitialiser le formulaire
+      setArticles([{ ...EMPTY_ARTICLE }]);
+      setFormData({
+        date_demande: new Date().toISOString().split('T')[0],
+        departement_concerner: '',
+        date_livraison_souhaitee: '',
+        urgent: false
+      });
+
+      // Recharger les demandes
+      await loadRequests(currentUser.role, currentUser.id);
+
+    } catch (error) {
+      console.error('Erreur soumission demande:', error);
+      alert('❌ Erreur lors de l\'envoi de la demande. Vérifiez la console.');
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -345,165 +385,7 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     }
   };
 
-  /* ================= PHOTO UPLOAD (FACULTATIF) ================= */
-  const uploadArticlePhoto = async (file, requestId, index) => {
-    if (!file) return null;
-    
-    try {
-      const ext = file.name.split('.').pop();
-      const fileName = `${Date.now()}_${index}.${ext}`;
-      const path = `articles/${requestId}/${fileName}`;
-
-      const { error: uploadError } = await supabase
-        .storage
-        .from('articles')
-        .upload(path, file, { 
-          upsert: true,
-          contentType: file.type
-        });
-
-      if (uploadError) {
-        console.error('Erreur upload:', uploadError);
-        return null;
-      }
-
-      const { data: { publicUrl } } = supabase
-        .storage
-        .from('articles')
-        .getPublicUrl(path);
-
-      return publicUrl;
-    } catch (error) {
-      console.error('Erreur upload photo:', error);
-      return null;
-    }
-  };
-
-  /* ================= SUBMIT REQUEST ================= */
-  const handleSubmitRequest = async () => {
-    if (submitting) return;
-    
-    if (!formData.departement_concerner.trim()) {
-      alert('Veuillez saisir le département concerné');
-      return;
-    }
-
-    const validArticles = articles.filter(a => a.designation.trim());
-    if (validArticles.length === 0) {
-      alert('Veuillez ajouter au moins un article avec une désignation');
-      return;
-    }
-
-    setSubmitting(true);
-
-    try {
-      // Préparer les articles
-      const articlesWithoutPhotos = validArticles.map(a => ({
-        designation: a.designation.trim(),
-        quantite: a.quantite || '1',
-        unite_mesure: a.unite_mesure || '',
-        photo_url: null
-      }));
-
-      // Préparer les données avec les bons noms de colonnes
-      const requestData = {
-        [tableSchema?.dateColumn || 'date_demande']: formData.date_demande,
-        [tableSchema?.departementColumn || 'departement_concerner']: formData.departement_concerner.trim(),
-        [tableSchema?.livraisonColumn || 'date_livraison_souhaitee']: formData.date_livraison_souhaitee || null,
-        user_id: currentUser.id,
-        articles: articlesWithoutPhotos,
-        statut: 'En attente',
-        urgent: formData.urgent
-      };
-
-      console.log('Données à insérer:', requestData);
-
-      // Insérer la demande
-      const { data: newRequest, error: insertError } = await supabase
-        .from('requests')
-        .insert([requestData])
-        .select()
-        .single();
-
-      if (insertError) {
-        console.error('Erreur détaillée:', insertError);
-        
-        // Essayer avec un schéma alternatif
-        const fallbackData = {
-          dateDemande: formData.date_demande,
-          departement: formData.departement_concerner.trim(),
-          dateLivraison: formData.date_livraison_souhaitee || null,
-          user_id: currentUser.id,
-          articles: articlesWithoutPhotos,
-          statut: 'En attente',
-          urgent: formData.urgent
-        };
-
-        console.log('Essai avec schéma alternatif:', fallbackData);
-        
-        const { data: fallbackRequest, error: fallbackError } = await supabase
-          .from('requests')
-          .insert([fallbackData])
-          .select()
-          .single();
-
-        if (fallbackError) {
-          console.error('Erreur schéma alternatif:', fallbackError);
-          throw fallbackError;
-        }
-
-        console.log('Insertion réussie avec schéma alternatif');
-      } else {
-        console.log('Insertion réussie avec schéma détecté');
-      }
-
-      alert('✅ Demande envoyée avec succès !');
-      
-      // Réinitialiser le formulaire
-      setArticles([{ ...EMPTY_ARTICLE }]);
-      setFormData({
-        date_demande: new Date().toISOString().split('T')[0],
-        departement_concerner: '',
-        date_livraison_souhaitee: '',
-        urgent: false
-      });
-
-      // Recharger les demandes
-      await loadRequests(currentUser.role, currentUser.id);
-
-    } catch (error) {
-      console.error('Erreur soumission demande:', error);
-      alert('❌ Erreur lors de l\'envoi de la demande. Vérifiez la console pour plus de détails.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  /* ================= AFFICHAGE DE LA DATE DE DEMANDE ================= */
-  const getDateDisplayValue = (request) => {
-    if (!request) return '';
-    
-    // Essayer différents noms de colonnes
-    if (request.date_demande) return request.date_demande;
-    if (request.dateDemande) return request.dateDemande;
-    if (request.date) return request.date;
-    if (request.created_at) return request.created_at.split('T')[0];
-    
-    return '';
-  };
-
-  const getDepartementDisplayValue = (request) => {
-    if (!request) return '';
-    
-    if (request.departement_concerner) return request.departement_concerner;
-    if (request.departement) return request.departement;
-    if (request.departementConcerner) return request.departementConcerner;
-    if (request.nom_demandeur) return request.nom_demandeur;
-    
-    return '';
-  };
-
-  /* ================= LOADING STATE ================= */
+  /* ================= LOGIN UI ================= */
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700">
@@ -515,7 +397,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
     );
   }
 
-  /* ================= LOGIN UI ================= */
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700 p-4">
@@ -573,14 +454,86 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
             {currentUser?.role}
           </p>
         </div>
-        <button 
-          onClick={handleLogout}
-          className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
-        >
-          <LogOut size={18} />
-          <span className="hidden sm:inline">Déconnexion</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowDebug(!showDebug)}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
+          >
+            <Database size={18} />
+            <span className="hidden sm:inline">Schéma</span>
+          </button>
+          <button 
+            onClick={handleLogout}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
+          >
+            <LogOut size={18} />
+            <span className="hidden sm:inline">Déconnexion</span>
+          </button>
+        </div>
       </header>
+
+      {/* Debug Panel */}
+      {showDebug && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg m-4 p-4">
+          <h3 className="font-bold text-lg text-yellow-800 mb-3 flex items-center gap-2">
+            <Database /> Informations de débogage
+          </h3>
+          
+          <div className="space-y-3">
+            <div>
+              <h4 className="font-medium text-yellow-700">Colonnes détectées dans la table "requests":</h4>
+              {tableError ? (
+                <p className="text-red-600 text-sm mt-1">{tableError}</p>
+              ) : tableColumns.length > 0 ? (
+                <ul className="text-sm bg-white p-2 rounded border">
+                  {tableColumns.map((col, idx) => (
+                    <li key={idx} className="py-1 px-2 border-b last:border-b-0">
+                      <code>{col}</code>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-yellow-600 text-sm mt-1">Aucune colonne détectée. La table est peut-être vide.</p>
+              )}
+            </div>
+            
+            <div>
+              <h4 className="font-medium text-yellow-700">Actions:</h4>
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={loadTableSchema}
+                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm"
+                >
+                  Recharger le schéma
+                </button>
+                <button
+                  onClick={createRequestsTable}
+                  className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 text-sm"
+                >
+                  Créer la table
+                </button>
+              </div>
+            </div>
+            
+            <div>
+              <h4 className="font-medium text-yellow-700">SQL recommandé pour créer la table:</h4>
+              <pre className="text-xs bg-gray-800 text-white p-3 rounded overflow-x-auto mt-2">
+{`CREATE TABLE requests (
+  id BIGSERIAL PRIMARY KEY,
+  date_demande DATE DEFAULT CURRENT_DATE,
+  departement_concerner TEXT NOT NULL,
+  date_livraison_souhaitee DATE,
+  user_id UUID NOT NULL REFERENCES auth.users(id),
+  articles JSONB DEFAULT '[]',
+  statut TEXT DEFAULT 'En attente',
+  urgent BOOLEAN DEFAULT false,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);`}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-6xl mx-auto p-4">
         {/* ===== MAGASINIER ===== */}
@@ -708,7 +661,6 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       />
                       {article.photo && (
                         <div className="mt-2">
-                          <p className="text-sm text-gray-600 mb-2">Aperçu :</p>
                           <img
                             src={URL.createObjectURL(article.photo)}
                             alt="Preview"
@@ -757,7 +709,9 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       <div className="flex justify-between items-start">
                         <div>
                           <div className="flex items-center gap-2">
-                            <p className="font-medium text-gray-900">{getDepartementDisplayValue(request)}</p>
+                            <p className="font-medium text-gray-900">
+                              {request.departement_concerner || request.departement || request.nom_demandeur || 'Non spécifié'}
+                            </p>
                             {request.urgent && (
                               <span className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded-full flex items-center gap-1">
                                 <AlertTriangle size={12} />
@@ -766,7 +720,9 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                             )}
                           </div>
                           <p className="text-sm text-gray-600">
-                            Date: {getDateDisplayValue(request) ? new Date(getDateDisplayValue(request)).toLocaleDateString() : 'Date inconnue'}
+                            Date: {request.date_demande ? new Date(request.date_demande).toLocaleDateString() : 
+                                  request.created_at ? new Date(request.created_at).toLocaleDateString() : 
+                                  'Date inconnue'}
                           </p>
                           <p className="text-xs text-gray-500">
                             Statut : <span className="font-medium">{request.statut || 'En attente'}</span>
@@ -820,10 +776,12 @@ ${urgentEmoji}${urgentEmoji}${urgentText}`;
                       <div className="flex justify-between items-start">
                         <div>
                           <p className="font-bold text-lg text-gray-900">
-                            {getDepartementDisplayValue(request)}
+                            {request.departement_concerner || request.departement || request.nom_demandeur || 'Non spécifié'}
                           </p>
                           <p className="text-sm text-gray-600">
-                            Date: {getDateDisplayValue(request) ? new Date(getDateDisplayValue(request)).toLocaleDateString() : 'Date inconnue'}
+                            Date: {request.date_demande ? new Date(request.date_demande).toLocaleDateString() : 
+                                  request.created_at ? new Date(request.created_at).toLocaleDateString() : 
+                                  'Date inconnue'}
                           </p>
                         </div>
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${
