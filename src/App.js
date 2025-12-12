@@ -1,12 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import {
-  Bell,
-  LogIn,
-  LogOut,
-  CheckCircle
-} from 'lucide-react';
+import { Bell, LogIn, LogOut, CheckCircle } from 'lucide-react';
 import { supabase } from './supabaseClient';
-import jsPDF from 'jspdf';
 
 /* ================= TELEGRAM (INCHANGÉ) ================= */
 const TELEGRAM_CONFIG = {
@@ -100,28 +94,20 @@ export default function App() {
   const subscribeRealtime = (role, userId) => {
     const reqChannel = supabase
       .channel('rt-requests')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'requests' },
-        payload => {
-          const r = payload.new;
-          if (role === 'magasinier' && r.user_id !== userId) return;
-          setRequests(prev => [r, ...prev.filter(x => x.id !== r.id)]);
-        }
-      )
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, payload => {
+        const r = payload.new;
+        if (role === 'magasinier' && r.user_id !== userId) return;
+        setRequests(prev => [r, ...prev.filter(x => x.id !== r.id)]);
+      })
       .subscribe();
 
     const notifChannel = supabase
       .channel('rt-notifs')
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'notifications' },
-        payload => {
-          if (payload.new.type === role) {
-            setNotifications(prev => [payload.new, ...prev]);
-          }
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, payload => {
+        if (payload.new.type === role) {
+          setNotifications(prev => [payload.new, ...prev]);
         }
-      )
+      })
       .subscribe();
 
     return () => {
@@ -192,54 +178,25 @@ export default function App() {
       0
     );
 
-    const { data: request } = await supabase
-      .from('requests')
-      .insert([
-        {
-          ...formData,
-          user_id: currentUser.id,
-          articles: valid,
-          totalGeneral,
-          statut: 'En attente',
-          dateCreation: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
+    await supabase.from('requests').insert([{
+      ...formData,
+      user_id: currentUser.id,
+      articles: valid,
+      totalGeneral,
+      statut: 'En attente',
+      dateCreation: new Date().toISOString()
+    }]);
 
-    await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_CONFIG.acheteurBotToken}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CONFIG.acheteurChatId,
-          text: `🛒 Nouvelle demande d'achat\n👤 ${formData.nomDemandeur}\n💰 ${totalGeneral.toFixed(
-            2
-          )} MAD`
-        })
-      }
-    );
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_CONFIG.acheteurBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CONFIG.acheteurChatId,
+        text: `🛒 Nouvelle demande d'achat\n👤 ${formData.nomDemandeur}\n💰 ${totalGeneral.toFixed(2)} MAD`
+      })
+    });
 
     setArticles([{ ...EMPTY_ARTICLE }]);
-  };
-
-  /* ================= EXPORT PDF ================= */
-  const exportPDF = (r) => {
-    const pdf = new jsPDF();
-    pdf.text(`Demande d'achat`, 10, 15);
-    pdf.text(`Demandeur : ${r.nomDemandeur}`, 10, 25);
-    let y = 40;
-    r.articles.forEach((a, i) => {
-      pdf.text(
-        `${i + 1}. ${a.designation} - ${a.quantite} x ${a.prix} MAD`,
-        10,
-        y
-      );
-      y += 6;
-    });
-    pdf.text(`Total : ${r.totalGeneral.toFixed(2)} MAD`, 10, y + 10);
-    pdf.save(`Demande_${r.id}.pdf`);
   };
 
   /* ================= LOGIN ================= */
@@ -311,9 +268,7 @@ export default function App() {
             <div
               key={n.id}
               onClick={() => markNotificationAsRead(n.id)}
-              className={`p-3 rounded ${
-                n.read ? 'bg-white' : 'bg-indigo-100'
-              }`}
+              className={`p-3 rounded ${n.read ? 'bg-white' : 'bg-indigo-100'}`}
             >
               {n.message}
             </div>
@@ -328,13 +283,6 @@ export default function App() {
             <p className="text-sm">
               💰 {r.totalGeneral?.toFixed(2)} MAD
             </p>
-
-            <button
-              onClick={() => exportPDF(r)}
-              className="text-sm text-indigo-600 underline mt-2"
-            >
-              📄 Export PDF
-            </button>
 
             {r.delaiLivraisonFournisseur && (
               <div className="mt-2 flex items-center gap-2 text-green-600">
