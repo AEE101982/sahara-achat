@@ -1,15 +1,16 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ShoppingCart,
   Package,
   Bell,
   LogIn,
   LogOut,
-  CheckCircle
+  CheckCircle,
+  AlertTriangle
 } from 'lucide-react';
 import { supabase } from './supabaseClient';
 
-/* ================= TELEGRAM (INCHANGÉ) ================= */
+/* ================= TELEGRAM ================= */
 const TELEGRAM_CONFIG = {
   acheteurBotToken: '8210812171:AAFac_FmCYk9d_RIuG0KJof17evWdzP37w',
   acheteurChatId: '7903997817',
@@ -21,8 +22,7 @@ const TELEGRAM_CONFIG = {
 const EMPTY_ARTICLE = {
   designation: '',
   quantite: '',
-  dimensions: '',
-  prix: '',
+  unite_mesure: '',
   photo: null,
   photo_url: null
 };
@@ -40,9 +40,10 @@ export default function App() {
 
   const [articles, setArticles] = useState([{ ...EMPTY_ARTICLE }]);
   const [formData, setFormData] = useState({
-    dateDemande: new Date().toISOString().split('T')[0],
-    nomDemandeur: '',
-    dateLivraisonSouhaitee: ''
+    date_demande: new Date().toISOString().split('T')[0],
+    departement_concerner: '',
+    date_livraison_souhaitee: '',
+    urgent: false
   });
 
   /* ================= SESSION ================= */
@@ -111,7 +112,7 @@ export default function App() {
       let q = supabase
         .from('requests')
         .select('*')
-        .order('datecreation', { ascending: false });
+        .order('date_creation', { ascending: false });
 
       if (role === 'magasinier') {
         q = q.eq('user_id', userId);
@@ -119,7 +120,21 @@ export default function App() {
 
       const { data, error } = await q;
       if (error) throw error;
-      setRequests(data || []);
+      
+      // Convert snake_case to camelCase for frontend
+      const formattedData = data?.map(item => ({
+        id: item.id,
+        dateDemande: item.date_demande,
+        departement: item.departement_concerner,
+        dateLivraisonSouhaitee: item.date_livraison_souhaitee,
+        userId: item.user_id,
+        articles: item.articles,
+        statut: item.statut,
+        urgent: item.urgent,
+        dateCreation: item.date_creation
+      })) || [];
+      
+      setRequests(formattedData);
     } catch (error) {
       console.error('Erreur chargement demandes:', error);
     }
@@ -153,17 +168,30 @@ export default function App() {
           table: 'requests',
           filter: role === 'magasinier' ? `user_id=eq.${userId}` : undefined
         },
-        (payload) => {
+        async (payload) => {
           const newRequest = payload.new;
           const oldRequest = payload.old;
+          
+          // Format new request for frontend
+          const formattedRequest = newRequest ? {
+            id: newRequest.id,
+            dateDemande: newRequest.date_demande,
+            departement: newRequest.departement_concerner,
+            dateLivraisonSouhaitee: newRequest.date_livraison_souhaitee,
+            userId: newRequest.user_id,
+            articles: newRequest.articles,
+            statut: newRequest.statut,
+            urgent: newRequest.urgent,
+            dateCreation: newRequest.date_creation
+          } : null;
           
           setRequests(prev => {
             switch (payload.eventType) {
               case 'INSERT':
-                return [newRequest, ...prev];
+                return [formattedRequest, ...prev];
               case 'UPDATE':
                 return prev.map(req => 
-                  req.id === newRequest.id ? newRequest : req
+                  req.id === formattedRequest.id ? formattedRequest : req
                 );
               case 'DELETE':
                 return prev.filter(req => req.id !== oldRequest.id);
@@ -178,6 +206,51 @@ export default function App() {
     return () => {
       supabase.removeChannel(channel);
     };
+  };
+
+  /* ================= TELEGRAM NOTIFICATION ================= */
+  const sendTelegramNotification = async (requestData) => {
+    try {
+      const botToken = currentUser.role === 'magasinier' 
+        ? TELEGRAM_CONFIG.magasinierBotToken 
+        : TELEGRAM_CONFIG.acheteurBotToken;
+      
+      const chatId = currentUser.role === 'magasinier'
+        ? TELEGRAM_CONFIG.magasinierChatId
+        : TELEGRAM_CONFIG.acheteurChatId;
+
+      const urgentEmoji = requestData.urgent ? '🚨 ' : '';
+      const urgentText = requestData.urgent ? '(URGENT) ' : '';
+      
+      const articlesText = requestData.articles?.map((article, idx) => 
+        `${idx + 1}. ${article.designation} - ${article.quantite} ${article.unite_mesure || ''}`
+      ).join('\n') || 'Aucun article';
+
+      const message = `${urgentEmoji}*NOUVELLE DEMANDE ${urgentText}*
+      
+*Département:* ${requestData.departement}
+*Date souhaitée:* ${requestData.dateLivraisonSouhaitee || 'Non spécifiée'}
+*Urgent:* ${requestData.urgent ? 'OUI 🚨' : 'Non'}
+
+*Articles:*
+${articlesText}
+
+${urgentEmoji}${urgentEmoji}${urgentText}`;
+
+      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'Markdown'
+        })
+      });
+    } catch (error) {
+      console.error('Erreur envoi Telegram:', error);
+    }
   };
 
   /* ================= AUTH ================= */
@@ -255,8 +328,8 @@ export default function App() {
     if (submitting) return;
     
     // Validation
-    if (!formData.nomDemandeur.trim()) {
-      alert('Veuillez saisir votre nom');
+    if (!formData.departement_concerner.trim()) {
+      alert('Veuillez saisir le département concerné');
       return;
     }
 
@@ -273,28 +346,26 @@ export default function App() {
       const articlesWithoutPhotos = validArticles.map(a => ({
         designation: a.designation.trim(),
         quantite: a.quantite || '1',
-        dimensions: a.dimensions || '',
-        prix: a.prix || '0',
+        unite_mesure: a.unite_mesure || '',
         photo_url: null
       }));
 
-      // Calculer le total
-      const totalGeneral = articlesWithoutPhotos.reduce(
-        (sum, a) => sum + (parseFloat(a.prix) || 0) * (parseFloat(a.quantite) || 1),
-        0
-      );
+      // Préparer les données pour la base de données (snake_case)
+      const requestData = {
+        date_demande: formData.date_demande,
+        departement_concerner: formData.departement_concerner.trim(),
+        date_livraison_souhaitee: formData.date_livraison_souhaitee || null,
+        user_id: currentUser.id,
+        articles: articlesWithoutPhotos,
+        statut: 'En attente',
+        urgent: formData.urgent,
+        date_creation: new Date().toISOString()
+      };
 
       // Insérer la demande initiale
       const { data: newRequest, error: insertError } = await supabase
         .from('requests')
-        .insert([{
-          ...formData,
-          user_id: currentUser.id,
-          articles: articlesWithoutPhotos,
-          totalGeneral,
-          statut: 'En attente',
-          datecreation: new Date().toISOString()
-        }])
+        .insert([requestData])
         .select()
         .single();
 
@@ -323,12 +394,20 @@ export default function App() {
 
       if (updateError) throw updateError;
 
+      // Envoyer notification Telegram
+      const fullRequestData = {
+        ...requestData,
+        articles: updatedArticles
+      };
+      await sendTelegramNotification(fullRequestData);
+
       // Réinitialiser le formulaire
       setArticles([{ ...EMPTY_ARTICLE }]);
       setFormData({
-        dateDemande: new Date().toISOString().split('T')[0],
-        nomDemandeur: '',
-        dateLivraisonSouhaitee: ''
+        date_demande: new Date().toISOString().split('T')[0],
+        departement_concerner: '',
+        date_livraison_souhaitee: '',
+        urgent: false
       });
 
       alert('✅ Demande envoyée avec succès !');
@@ -462,7 +541,7 @@ export default function App() {
               </h2>
 
               {/* Form Fields */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
                     Date de demande
@@ -470,20 +549,20 @@ export default function App() {
                   <input
                     type="date"
                     className="w-full p-3 border border-gray-300 rounded-lg"
-                    value={formData.dateDemande}
-                    onChange={e => setFormData({ ...formData, dateDemande: e.target.value })}
+                    value={formData.date_demande}
+                    onChange={e => setFormData({ ...formData, date_demande: e.target.value })}
                   />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Nom du demandeur
+                    Département concerné *
                   </label>
                   <input
                     type="text"
-                    placeholder="Votre nom"
+                    placeholder="Ex: Production, Maintenance, etc."
                     className="w-full p-3 border border-gray-300 rounded-lg"
-                    value={formData.nomDemandeur}
-                    onChange={e => setFormData({ ...formData, nomDemandeur: e.target.value })}
+                    value={formData.departement_concerner}
+                    onChange={e => setFormData({ ...formData, departement_concerner: e.target.value })}
                     required
                   />
                 </div>
@@ -494,9 +573,23 @@ export default function App() {
                   <input
                     type="date"
                     className="w-full p-3 border border-gray-300 rounded-lg"
-                    value={formData.dateLivraisonSouhaitee}
-                    onChange={e => setFormData({ ...formData, dateLivraisonSouhaitee: e.target.value })}
+                    value={formData.date_livraison_souhaitee}
+                    onChange={e => setFormData({ ...formData, date_livraison_souhaitee: e.target.value })}
                   />
+                </div>
+                <div className="flex items-center">
+                  <label className="flex items-center space-x-2 p-3 border border-gray-300 rounded-lg w-full h-full cursor-pointer hover:bg-gray-50">
+                    <input
+                      type="checkbox"
+                      className="rounded text-indigo-600"
+                      checked={formData.urgent}
+                      onChange={e => setFormData({ ...formData, urgent: e.target.checked })}
+                    />
+                    <span className="flex items-center gap-2 font-medium">
+                      <AlertTriangle className="text-red-500" size={18} />
+                      Demande Urgente
+                    </span>
+                  </label>
                 </div>
               </div>
 
@@ -528,7 +621,7 @@ export default function App() {
                       required
                     />
 
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                       <div>
                         <input
                           placeholder="Quantité"
@@ -541,20 +634,10 @@ export default function App() {
                       </div>
                       <div>
                         <input
-                          placeholder="Prix unitaire (MAD)"
-                          type="number"
-                          step="0.01"
+                          placeholder="Unité de mesure (kg, L, Pièces, etc.)"
                           className="w-full p-3 border border-gray-300 rounded-lg"
-                          value={article.prix}
-                          onChange={e => updateArticle(index, 'prix', e.target.value)}
-                        />
-                      </div>
-                      <div>
-                        <input
-                          placeholder="Dimensions"
-                          className="w-full p-3 border border-gray-300 rounded-lg"
-                          value={article.dimensions}
-                          onChange={e => updateArticle(index, 'dimensions', e.target.value)}
+                          value={article.unite_mesure}
+                          onChange={e => updateArticle(index, 'unite_mesure', e.target.value)}
                         />
                       </div>
                     </div>
@@ -614,10 +697,23 @@ export default function App() {
               ) : (
                 <div className="space-y-3">
                   {requests.map(request => (
-                    <div key={request.id} className="border border-gray-200 rounded-lg p-4 hover:bg-gray-50">
+                    <div 
+                      key={request.id} 
+                      className={`border rounded-lg p-4 hover:bg-gray-50 ${
+                        request.urgent ? 'border-red-300 bg-red-50' : 'border-gray-200'
+                      }`}
+                    >
                       <div className="flex justify-between items-start">
                         <div>
-                          <p className="font-medium text-gray-900">{request.nomDemandeur}</p>
+                          <div className="flex items-center gap-2">
+                            <p className="font-medium text-gray-900">{request.departement}</p>
+                            {request.urgent && (
+                              <span className="bg-red-100 text-red-800 text-xs px-2 py-1 rounded-full flex items-center gap-1">
+                                <AlertTriangle size={12} />
+                                URGENT
+                              </span>
+                            )}
+                          </div>
                           <p className="text-sm text-gray-600">
                             {new Date(request.dateDemande).toLocaleDateString()}
                           </p>
@@ -626,9 +722,6 @@ export default function App() {
                           </p>
                         </div>
                         <div className="text-right">
-                          <p className="font-bold text-indigo-700">
-                            {parseFloat(request.totalGeneral || 0).toFixed(2)} MAD
-                          </p>
                           <p className="text-xs text-gray-500">
                             {request.articles?.length || 0} article(s)
                           </p>
@@ -658,13 +751,26 @@ export default function App() {
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {requests.map(request => (
-                  <div key={request.id} className="bg-white rounded-2xl shadow-lg overflow-hidden">
+                  <div 
+                    key={request.id} 
+                    className={`bg-white rounded-2xl shadow-lg overflow-hidden ${
+                      request.urgent ? 'border-2 border-red-500' : ''
+                    }`}
+                  >
+                    {request.urgent && (
+                      <div className="bg-red-500 text-white p-2 text-center font-bold flex items-center justify-center gap-2">
+                        <AlertTriangle size={18} />
+                        DEMANDE URGENTE
+                        <AlertTriangle size={18} />
+                      </div>
+                    )}
+                    
                     <div className="p-6 space-y-4">
                       {/* Header */}
                       <div className="flex justify-between items-start">
                         <div>
                           <p className="font-bold text-lg text-gray-900">
-                            {request.nomDemandeur}
+                            {request.departement}
                           </p>
                           <p className="text-sm text-gray-600">
                             {new Date(request.dateDemande).toLocaleDateString()}
@@ -682,17 +788,19 @@ export default function App() {
                       {/* Details */}
                       <div className="grid grid-cols-2 gap-4">
                         <div className="bg-gray-50 p-3 rounded-lg">
-                          <p className="text-xs text-gray-500">Total général</p>
-                          <p className="font-bold text-xl text-gray-900">
-                            {parseFloat(request.totalGeneral || 0).toFixed(2)} MAD
-                          </p>
-                        </div>
-                        <div className="bg-gray-50 p-3 rounded-lg">
                           <p className="text-xs text-gray-500">Date livraison souhaitée</p>
                           <p className="font-medium text-gray-900">
                             {request.dateLivraisonSouhaitee ? 
                               new Date(request.dateLivraisonSouhaitee).toLocaleDateString() : 
                               'Non spécifiée'}
+                          </p>
+                        </div>
+                        <div className={`p-3 rounded-lg ${
+                          request.urgent ? 'bg-red-50' : 'bg-gray-50'
+                        }`}>
+                          <p className="text-xs text-gray-500">Type de demande</p>
+                          <p className={`font-medium ${request.urgent ? 'text-red-700' : 'text-gray-900'}`}>
+                            {request.urgent ? 'URGENTE 🚨' : 'Normale'}
                           </p>
                         </div>
                       </div>
@@ -705,14 +813,11 @@ export default function App() {
                             <div key={idx} className="bg-gray-50 rounded-lg p-3">
                               <p className="font-medium text-gray-900">{article.designation}</p>
                               <div className="flex justify-between text-sm text-gray-600 mt-2">
-                                <span>Qté: {article.quantite || '1'}</span>
-                                <span>Prix: {parseFloat(article.prix || 0).toFixed(2)} MAD</span>
+                                <span>Quantité: {article.quantite || '1'}</span>
+                                {article.unite_mesure && (
+                                  <span>Unité: {article.unite_mesure}</span>
+                                )}
                               </div>
-                              {article.dimensions && (
-                                <p className="text-xs text-gray-500 mt-1">
-                                  Dimensions: {article.dimensions}
-                                </p>
-                              )}
                               {article.photo_url && (
                                 <div className="mt-2">
                                   <img
@@ -729,12 +834,12 @@ export default function App() {
 
                       {/* Actions */}
                       <div className="flex gap-3 pt-4 border-t">
-                        <button className="flex-1 bg-green-600 text-white py-2 rounded-lg hover:bg-green-700">
-                          <CheckCircle className="inline mr-2" size={18} />
+                        <button className="flex-1 bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 flex items-center justify-center gap-2">
+                          <CheckCircle size={18} />
                           Valider
                         </button>
-                        <button className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-lg hover:bg-gray-200">
-                          Voir détails
+                        <button className="flex-1 bg-red-600 text-white py-2 rounded-lg hover:bg-red-700">
+                          Refuser
                         </button>
                       </div>
                     </div>
